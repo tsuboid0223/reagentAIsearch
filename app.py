@@ -9,7 +9,7 @@ import json
 import re
 import concurrent.futures
 
-# === AIエージェントと関連関数の定義 ===
+# ==== AIエージェントと関連関数の定義 ====
 
 def translate_text_with_gemini(text_to_translate, gemini_api_key):
     try:
