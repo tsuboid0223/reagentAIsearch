@@ -44,6 +44,14 @@ def search_product_urls_with_brightdata(query, api_key):
                 result_response = requests.get(result_url, headers={'Authorization': f'Bearer {api_key}'}, timeout=30)
                 result_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
                 
+                # --- ここから追加/変更部分 ---
+                with st.expander(f"【Bright Data】試行 {i} の生レスポンス (ステータスコード: {result_response.status_code})"):
+                    if result_response.text:
+                        st.code(result_response.text, language='html')
+                    else:
+                        st.write("レスポンス本文は空でした。")
+                # --- ここまで追加/変更部分 ---
+
                 if result_response.status_code == 200:
                     st.success(f"【Bright Data】結果取得完了 (ステータスコード: {result_response.status_code})。")
                     try:
