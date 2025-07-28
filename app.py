@@ -11,7 +11,7 @@ import concurrent.futures
 
 # === 3. AIエージェントと関連関数の定義 (Colab版から流用) ===
 
-def search_product_urls_with_brightdata(query, api_key):
+def search_product_urls_with_brightdata(query, api_key, debug_mode=False): # debug_mode引数を追加
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
 
     headers = {
@@ -26,9 +26,11 @@ def search_product_urls_with_brightdata(query, api_key):
         initial_response = requests.post('https://api.brightdata.com/serp/req', headers=headers, json=payload, timeout=30)
         initial_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
-        # --- 追加のデバッグログ: 初期リクエストのステータスコードとレスポンス本文の一部 ---
-        st.info(f"【Bright Data】初期リクエスト ステータスコード: {initial_response.status_code}")
-        st.info(f"【Bright Data】初期リクエスト レスポンス本文 (最初の200文字): {initial_response.text[:200]}...")
+        # --- デバッグモード時のみ表示 ---
+        if debug_mode:
+            st.info(f"【Bright Data】初期リクエスト ステータスコード: {initial_response.status_code}")
+            st.info(f"【Bright Data】初期リクエスト レスポンス本文 (最初の200文字): {initial_response.text[:200]}...")
+        # --- ここまでデバッグモード時のみ表示 ---
 
         response_id = initial_response.headers.get('x-response-id')
         if not response_id:
@@ -48,17 +50,16 @@ def search_product_urls_with_brightdata(query, api_key):
                 result_response = requests.get(result_url, headers={'Authorization': f'Bearer {api_key}'}, timeout=30)
                 result_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
                 
-                # --- 追加のデバッグログ: 各試行の結果取得ステータスコードとレスポンス本文の一部 ---
-                st.info(f"【Bright Data】試行 {i} 結果取得ステータスコード: {result_response.status_code}")
-                st.info(f"【Bright Data】試行 {i} 結果取得レスポンス本文 (最初の200文字): {result_response.text[:200]}...")
-
-                # --- 既存の展開可能な生レスポンス表示部分 ---
-                with st.expander(f"【Bright Data】試行 {i} の生レスポンス (ステータスコード: {result_response.status_code})"):
-                    if result_response.text:
-                        st.code(result_response.text, language='html')
-                    else:
-                        st.write("レスポンス本文は空でした。")
-                # --- ここまで既存の展開可能な生レスポンス表示部分 ---
+                # --- デバッグモード時のみ表示 ---
+                if debug_mode:
+                    st.info(f"【Bright Data】試行 {i} 結果取得ステータスコード: {result_response.status_code}")
+                    st.info(f"【Bright Data】試行 {i} 結果取得レスポンス本文 (最初の200文字): {result_response.text[:200]}...")
+                    with st.expander(f"【Bright Data】試行 {i} の生レスポンス (ステータスコード: {result_response.status_code})"):
+                        if result_response.text:
+                            st.code(result_response.text, language='html')
+                        else:
+                            st.write("レスポンス本文は空でした。")
+                # --- ここまでデバッグモード時のみ表示 ---
 
                 if result_response.status_code == 200:
                     st.success(f"【Bright Data】結果取得完了 (ステータスコード: {result_response.status_code})。")
@@ -167,7 +168,7 @@ def analyze_page_and_extract_info(url, product_name, gemini_api_key):
         st.error(f"Gemini API呼び出しエラー: {e}。URL: {url}")
         return None
 
-def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites=[]):
+def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites=[], debug_mode=False): # debug_mode引数を追加
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
     st.subheader(f"【統括エージェント】 \"{product_name}\" の情報収集を開始します。")
@@ -186,7 +187,8 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
     search_queries.append(base_query)
     all_urls = []
     for query in search_queries:
-        all_urls.extend(search_product_urls_with_brightdata(query, brightdata_api_key))
+        # search_product_urls_with_brightdata 関数に debug_mode を渡す
+        all_urls.extend(search_product_urls_with_brightdata(query, brightdata_api_key, debug_mode))
     unique_urls = list(dict.fromkeys(all_urls))
     html_urls = [url for url in unique_urls if not url.lower().endswith(('.pdf', '.xls', '.xlsx', '.doc', '.docx'))]
     if not html_urls:
@@ -251,6 +253,9 @@ max_price_input = st.sidebar.number_input("最高価格 (円)", min_value=0, val
 
 preferred_sites_toggle = st.sidebar.checkbox("優先サイト検索 (コスモバイオ, フナコシ, AXEL, など)")
 
+# --- デバッグモードのチェックボックスを追加 ---
+debug_mode_checkbox = st.sidebar.checkbox("デバッグモードを有効にする (生のHTMLを表示)")
+
 # 検索ボタン
 search_button = st.sidebar.button("検索開始", type="primary")
 
@@ -276,7 +281,8 @@ if search_button:
             if preferred_sites_toggle:
                 preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM']
 
-            offers_list = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites)
+            # orchestrator_agent 関数に debug_mode_checkbox の状態を渡す
+            offers_list = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites, debug_mode_checkbox)
 
             final_results = []
             input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
