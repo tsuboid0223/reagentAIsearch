@@ -177,7 +177,8 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
     site_map = {
         'コスモバイオ': 'cosmobio.co.jp', 'フナコシ': 'funakoshi.co.jp', 'AXEL': 'axel.as-1.co.jp',
         'Selleck': 'selleck.co.jp', 'MCE': 'medchemexpress.com', 'Nakarai': 'nacalai.co.jp',
-        'FUJIFILM': 'labchem-wako.fujifilm.com'
+        'FUJIFILM': 'labchem-wako.fujifilm.com', '関東化学': 'kanto.co.jp', 
+        'TCI': 'tcichemicals.com', 'Merck': 'merck.com', '和光純薬': 'hpc-j.co.jp'
     }
     search_queries = []
     if preferred_sites:
@@ -276,7 +277,7 @@ if search_button:
             }
             
             # 優先サイト検索をデフォルトで実行するように変更
-            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM']
+            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
 
             # orchestrator_agent 関数に debug_mode_checkbox の状態を渡す
             offers_list = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites, debug_mode_checkbox)
