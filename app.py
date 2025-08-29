@@ -251,9 +251,7 @@ unit_input = st.sidebar.text_input("単位", value="pcs")
 min_price_input = st.sidebar.number_input("最低価格 (円)", min_value=0, value=0, step=100)
 max_price_input = st.sidebar.number_input("最高価格 (円)", min_value=0, value=0, step=100)
 
-preferred_sites_toggle = st.sidebar.checkbox("優先サイト検索 (コスモバイオ, フナコシ, AXEL, など)")
-
-# --- デバッグモードのチェックボックスを追加 ---
+# --- デバッグモードのチェックボックスを残す ---
 debug_mode_checkbox = st.sidebar.checkbox("デバッグモードを有効にする (生のHTMLを表示)")
 
 # 検索ボタン
@@ -277,9 +275,8 @@ if search_button:
                 'Unit': unit_input
             }
             
-            preferred_sites = []
-            if preferred_sites_toggle:
-                preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM']
+            # 優先サイト検索をデフォルトで実行するように変更
+            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM']
 
             # orchestrator_agent 関数に debug_mode_checkbox の状態を渡す
             offers_list = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites, debug_mode_checkbox)
