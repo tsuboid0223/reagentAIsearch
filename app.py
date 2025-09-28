@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（プロキシ直書き・最終確定版）
+（プロキシ接続バグ修正・最終確定版）
 """
 
 # ==============================================================================
@@ -24,23 +24,19 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # === Bright Data API 連携関数 ===
 # ==============================================================================
 
-def get_page_content_with_brightdata(url: str) -> dict:
+def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
     """
-    [最終修正] スクリーンショットから判明した正確な認証情報をコードに直接書き込み、
-    プロキシ経由でHTMLを取得する。これが最も確実な方法。
+    Bright Dataのプロキシ経由でHTMLを取得する。
+    api_keyをプロキシのパスワードとして使用する。
     """
-    # ### ▼▼▼ あなたのBright Data接続情報をスクリーンショットから反映済み ▼▼▼ ###
     BRD_HOST = 'brd.superproxy.io'
     BRD_PORT = 22225
     BRD_USERNAME = 'brd-customer-hl_3c49a4bb-zone-scraping_browser1'
-    BRD_PASSWORD = 'c6v8ohrtd8zf'
-    # ### ▲▲▲ 設定完了 ▲▲▲ ###
+    BRD_PASSWORD = api_key  # 受け取ったAPIキーをパスワードとして使用
 
     proxy_url = f'http://{BRD_USERNAME}:{BRD_PASSWORD}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    }
+    headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36' }
     result = {"url": url, "status_code": None, "headers": None, "content": None, "error": None}
     
     try:
@@ -162,7 +158,8 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     all_page_content_results, found_pages_data = [], []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_url = {executor.submit(get_page_content_with_brightdata, url): url for url in unique_urls}
+        # [バグ修正] get_page_content_with_brightdata に brightdata_api_key を正しく渡す
+        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brightdata_api_key): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
             my_bar.progress((i + 1) / len(unique_urls), text=f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
