@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（ブロック検知機能付き・最終アクセス強化版）
+（最終アクセス強化・超詳細デバッグ版）
 """
 
 # ==============================================================================
@@ -21,44 +21,49 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
-# === Bright Data API 連携関数 (Scraping Browser API利用) ===
+# === Bright Data API 連携関数 (プロキシアクセス + 超詳細デバッグ) ===
 # ==============================================================================
 
 def get_page_content_with_brightdata(url: str, api_key: str, debug_mode: bool = False) -> tuple[str | None, str | None]:
     """
-    [修正点] Bright DataのScraping Browser APIを直接呼び出す方式に戻す。
-    この方法はJavaScriptのレンダリングやCAPTCHA回避に最も強力。
+    [最終修正] Bright Dataのプロキシマネージャーを経由してHTMLを取得する。
+    失敗時には詳細なデバッグ情報を表示する。
     """
-    headers = {'Authorization': f'Bearer {api_key}'}
-    # Bright Data管理画面で作成した "Browser API" 用のゾーン名を指定
-    brightdata_zone_name = 'scraping_browser1'
-    payload = {'url': url, 'zone': brightdata_zone_name, 'country': 'jp'} 
+    # ### ▼▼▼ あなたのBright Data接続情報に更新済みです ▼▼▼ ###
+    BRD_HOST = 'brd.superproxy.io'
+    BRD_PORT = 22225
+    BRD_USERNAME = 'brd-customer-hl_3c49a4bb-zone-scraping_browser1'
+    BRD_PASSWORD = 'c6v8ohrtd8zf'
+    # ### ▲▲▲ 設定完了 ▲▲▲ ###
+
+    proxy_url = f'http://{BRD_USERNAME}:{BRD_PASSWORD}@{BRD_HOST}:{BRD_PORT}'
+    proxies = {'http': proxy_url, 'https': proxy_url}
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    }
 
     try:
-        # 初期リクエストを送信
-        initial_response = requests.post('https://api.brightdata.com/scraping/browser/request', headers=headers, json=payload, timeout=40)
-        initial_response.raise_for_status()
-        response_id = initial_response.headers.get('x-response-id')
-
-        if not response_id:
-            st.warning(f"【Bright Data Scraper】URL '{url}' のResponse IDが取得できませんでした。")
-            return None, "Response ID not found"
-
-        # 結果をポーリングして取得
-        result_url = f'https://api.brightdata.com/scraping/browser/response?response_id={response_id}'
-        for _ in range(15):  # 最大45秒間待機
-            time.sleep(3)
-            result_response = requests.get(result_url, headers=headers, timeout=30)
-            if result_response.status_code == 200:
-                return result_response.text, None  # 成功
-            if result_response.status_code != 202:  # 202は処理中ステータス
-                error_message = f"Unexpected status code: {result_response.status_code}. Body: {result_response.text[:200]}"
-                return None, error_message
+        response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=60)
         
-        return None, "Polling timed out after 45 seconds"
+        # [新機能] 超詳細デバッグログ
+        if debug_mode:
+            with st.expander(f"【詳細デバッグ】プロキシアクセス試行 (URL: {url})"):
+                st.write(f"**ステータスコード:** `{response.status_code}`")
+                st.write("**レスポンスヘッダー:**")
+                st.json(dict(response.headers))
+                st.write("**レスポンスボディ (最初の1000文字):**")
+                st.code(response.text[:1000] if response.text else "レスポンスボディは空です。", language='html')
+
+        response.raise_for_status()
+        return response.text, None
 
     except requests.exceptions.RequestException as e:
-        return None, f"Request failed: {e}"
+        error_message = f"プロキシ経由でのアクセスに失敗しました: {e}"
+        # エラーレスポンスがあれば、その内容も表示
+        if hasattr(e, 'response') and e.response is not None:
+             error_message += f"\n**ステータスコード:** `{e.response.status_code}`\n**レスポンス:** `{e.response.text[:200]}`"
+        return None, error_message
 
 
 def search_product_urls_with_brightdata(query: str, api_key: str, debug_mode: bool = False) -> list:
@@ -80,14 +85,8 @@ def search_product_urls_with_brightdata(query: str, api_key: str, debug_mode: bo
             time.sleep(2)
             try:
                 result_response = requests.get(result_url, headers={'Authorization': f'Bearer {api_key}'}, timeout=30)
-                if debug_mode:
-                    with st.expander(f"【デバッグ】SERP API試行 {i} (クエリ: {query})"):
-                        st.write(f"ステータスコード: {result_response.status_code}")
-                        st.code(result_response.text[:500], language='html')
                 if result_response.status_code == 200:
-                    if not result_response.text:
-                        st.warning("検索結果は取得できましたが、レスポンスが空でした。")
-                        return []
+                    if not result_response.text: return []
                     soup = BeautifulSoup(result_response.text, 'html.parser')
                     urls = [ a.get('href') for a in soup.find_all('a', href=True) if a.get('href') and a.get('href').startswith('http') and not a.get('href').startswith('https://www.google.com') ]
                     unique_urls = list(dict.fromkeys(urls))
@@ -110,23 +109,16 @@ def search_product_urls_with_brightdata(query: str, api_key: str, debug_mode: bo
 # ==============================================================================
 
 def is_blocked_page(html_content: str) -> bool:
-    """
-    HTMLコンテンツにブロックされていることを示すキーワードが含まれているか判定する。
-    """
-    if not html_content:
-        return False
-    
+    if not html_content: return False
     block_keywords = [
         "cloudflare", "access denied", "site is protected", "checking your browser",
         "captcha", "are you a human", "アクセスが拒否されました", "サイト所有者によってブロック"
     ]
-    
     lower_content = html_content.lower()
     for keyword in block_keywords:
         if keyword in lower_content:
             return True
     return False
-
 
 def analyze_page_and_extract_info(url: str, product_name: str, gemini_api_key: str, brightdata_api_key: str, debug_mode: bool = False) -> dict | None:
     html_content, error = get_page_content_with_brightdata(url, brightdata_api_key, debug_mode)
@@ -134,12 +126,8 @@ def analyze_page_and_extract_info(url: str, product_name: str, gemini_api_key: s
         st.warning(f"URL {url} のコンテンツ取得に失敗しました: {error}")
         return None
 
-    # [新機能] ブロック検知
     if is_blocked_page(html_content):
-        st.error(f"URL {url} はセキュリティシステムによりブロックされました。コンテンツを解析できません。")
-        if debug_mode:
-            with st.expander(f"【デバッグ】ブロックされたページのHTML (URL: {url})"):
-                st.code(html_content[:2000], language='html')
+        st.error(f"URL {url} はセキュリティシステムによりブロックされました。")
         return None
 
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -148,19 +136,15 @@ def analyze_page_and_extract_info(url: str, product_name: str, gemini_api_key: s
     body_text = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
     
     if not body_text:
-        st.info(f"URL {url} からテキスト情報を抽出できませんでした。（コンテンツがJavaScriptのみで構成されている可能性があります）")
+        st.info(f"URL {url} からテキスト情報を抽出できませんでした。")
         return None
     if len(body_text) > 18000:
         body_text = body_text[:18000]
 
-    if debug_mode:
-        with st.expander(f"【デバッグ情報】解析対象テキスト (URL: {url})"):
-            st.text(body_text[:1000])
-
     prompt = f"""
-    You are an Analyst Agent. Your task is to analyze the following text content from a product webpage... (省略)
+    You are an Analyst Agent. Your task is to analyze... (省略)
     """
-    # (プロンプト内容は変更なしのため省略)
+    # (プロンプトは変更なしのため省略)
     prompt = f"""
     You are an Analyst Agent. Your task is to analyze the following text content from a product webpage and extract key information about the specified product.
     **Product to find:** "{product_name}"
@@ -215,7 +199,6 @@ def analyze_page_and_extract_info(url: str, product_name: str, gemini_api_key: s
 # ==============================================================================
 # === 統括エージェント ===
 # ==============================================================================
-# (変更なし)
 def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, preferred_sites: list, debug_mode: bool = False) -> list:
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
@@ -259,9 +242,6 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
                 if page_details and page_details.get("offers"):
                     page_details['sourceUrl'] = url
                     found_pages.append(page_details)
-                # ここでのelseは、ブロック検知や解析失敗のログが出るので、冗長にならないようにコメントアウト
-                # else:
-                #     st.info(f"URL {url} から有効な製品情報が抽出できませんでした。")
             except Exception as exc:
                 st.error(f"URL {url} の処理中にエラーが発生しました: {exc}")
             
@@ -270,11 +250,10 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     st.success(f"【統括エージェント】{len(found_pages)}ページから製品情報を抽出しました。")
     return found_pages
 
-
 # ==============================================================================
 # === Streamlit UI アプリケーション部分 ===
 # ==============================================================================
-# (変更なし)
+
 st.set_page_config(layout="wide")
 st.title("製品調達AIエージェント")
 
