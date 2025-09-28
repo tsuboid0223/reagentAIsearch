@@ -9,25 +9,24 @@ import json
 import concurrent.futures
 
 # ==============================================================================
-# === 1. Bright Dataを使った高度なスクレイピング関数 (新規追加) ===
+# === 1. Bright Dataを使った高度なスクレイピング関数 (ゾーン名修正済み) ===
 # ==============================================================================
 def get_page_content_with_brightdata(url, api_key):
     """
     requests.getの代わりにBright DataのScraping Browserを使って
     JavaScriptレンダリング後のHTMLを取得する。
-    これにより、ボット対策を回避しやすくなる。
     """
     headers = {'Authorization': f'Bearer {api_key}'}
-    # Bright DataのScraping Browser APIエンドポイントを呼び出す
-    # ゾーン名はご自身の環境に合わせてください (例: 'scraping_browser1')
-    payload = {'url': url, 'zone': 'scraping_browser1', 'country': 'jp'} 
+    
+    # [修正点] Bright Dataの管理画面で作成したBrowser API用のゾーン名を指定します。
+    brightdata_zone_name = 'scraping_browser1'
+
+    payload = {'url': url, 'zone': brightdata_zone_name, 'country': 'jp'} 
 
     try:
-        # 初期リクエスト
         initial_response = requests.post('https://api.brightdata.com/scraping/browser/request', headers=headers, json=payload, timeout=40)
         initial_response.raise_for_status()
 
-        # レスポンスIDを取得して結果をポーリング
         response_id = initial_response.headers.get('x-response-id')
         if not response_id:
             st.warning(f"【Bright Data Scraper】URL '{url}' のResponse IDが取得できませんでした。")
@@ -35,12 +34,12 @@ def get_page_content_with_brightdata(url, api_key):
 
         result_url = f'https://api.brightdata.com/scraping/browser/response?response_id={response_id}'
 
-        for _ in range(15):  # 最大45秒間ポーリング
+        for _ in range(15):
             time.sleep(3)
             result_response = requests.get(result_url, headers=headers, timeout=30)
             if result_response.status_code == 200:
-                return result_response.text, None  # 成功：HTMLコンテンツを返す
-            if result_response.status_code != 202:  # 202は「処理中」
+                return result_response.text, None
+            if result_response.status_code != 202:
                 error_message = f"Unexpected status code: {result_response.status_code}. Body: {result_response.text[:200]}"
                 return None, error_message
         
@@ -51,14 +50,13 @@ def get_page_content_with_brightdata(url, api_key):
 
 
 # ==============================================================================
-# === 2. AIエージェントと関連関数の定義 (修正済み) ===
+# === 2. AIエージェントと関連関数の定義 (変更なし) ===
 # ==============================================================================
 
 def search_product_urls_with_brightdata(query, api_key, debug_mode=False):
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
     google_search_url = f"https://www.google.co.jp/search?q={urllib.parse.quote(query)}&hl=ja"
-    # SERP API用のゾーンを指定
     payload = {'zone': 'serp_api1', 'url': google_search_url}
 
     try:
@@ -108,7 +106,6 @@ def search_product_urls_with_brightdata(query, api_key, debug_mode=False):
 
 
 def analyze_page_and_extract_info(url, product_name, gemini_api_key, brightdata_api_key, debug_mode=False):
-    # [変更点] requests.getを新しい高機能な関数に置き換え
     html_content, error = get_page_content_with_brightdata(url, brightdata_api_key)
 
     if error or not html_content:
@@ -127,7 +124,6 @@ def analyze_page_and_extract_info(url, product_name, gemini_api_key, brightdata_
     if len(body_text) > 18000:
         body_text = body_text[:18000]
 
-    # [変更点] デバッグモード時に取得したコンテンツとAIに渡すテキストを表示
     if debug_mode:
         with st.expander(f"【デバッグ情報】URL: {url}"):
             st.subheader("取得した生HTML (最初の1000文字)")
@@ -205,7 +201,6 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
     my_bar = st.progress(0, text=progress_text)
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        # [変更点] analyze_page_and_extract_info に必要な引数をすべて渡す
         future_to_url = {
             executor.submit(analyze_page_and_extract_info, url, product_name, gemini_api_key, brightdata_api_key, debug_mode): url 
             for url in html_urls
