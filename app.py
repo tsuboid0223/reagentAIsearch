@@ -212,4 +212,113 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
 # ==============================================================================
 # === 3. Streamlit アプリケーションのメイン部分 (結果表示ロジック修正済み) ===
 # ==============================================================================
-st.set_page_config(layout=
+st.set_page_config(layout="wide")
+st.title("製品調達AIエージェント")
+
+st.sidebar.header("APIキー設定")
+try:
+    gemini_api_key = st.secrets["GOOGLE_API_KEY"]
+    brightdata_api_key = st.secrets["BRIGHTDATA_API_KEY"]
+    st.sidebar.success("APIキーが設定されています。")
+except KeyError:
+    st.sidebar.error("StreamlitにAPIキーが設定されていません。")
+    gemini_api_key = ""
+    brightdata_api_key = ""
+
+st.sidebar.header("検索条件")
+product_name_input = st.sidebar.text_input("製品名 (必須)", placeholder="例: Y27632")
+manufacturer_input = st.sidebar.text_input("メーカー", placeholder="例: Selleck")
+quantity_input = st.sidebar.number_input("数量", min_value=1, value=1)
+unit_input = st.sidebar.text_input("単位", value="pcs")
+min_price_input = st.sidebar.number_input("最低価格 (円)", min_value=0, value=0, step=100)
+max_price_input = st.sidebar.number_input("最高価格 (円)", min_value=0, value=0, step=100)
+
+debug_mode_checkbox = st.sidebar.checkbox("デバッグモードを有効にする (詳細ログ表示)")
+
+search_button = st.sidebar.button("検索開始", type="primary")
+
+if search_button:
+    if not gemini_api_key or not brightdata_api_key:
+        st.error("APIキーが設定されていません。StreamlitのSecretsにキーを登録してください。")
+    elif not product_name_input:
+        st.error("製品名を入力してください。")
+    else:
+        with st.spinner('検索中です...しばらくお待ちください。'):
+            product_info = {
+                'ProductName': product_name_input,
+                'Manufacturer': manufacturer_input,
+                'Quantity': quantity_input,
+                'Unit': unit_input
+            }
+            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
+            offers_list = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites, debug_mode_checkbox)
+            final_results = []
+            input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+
+            if offers_list:
+                # [修正点] 抽出したデータを整形するループ処理
+                for page_data in offers_list:
+                    # ページから抽出した各オファー（容量ごと）をループ
+                    for offer_item in page_data.get('offers', []):
+                        price = 0
+                        try:
+                            price = int(float(offer_item.get('price', 0)))
+                        except (ValueError, TypeError):
+                            price = 0
+                        
+                        final_results.append({
+                            '入力日': input_date,
+                            '製品名': page_data.get('productName', 'N/A'),
+                            '型番/製品番号': page_data.get('modelNumber', 'N/A'),
+                            '仕様': offer_item.get('size', 'N/A'), # AIが抽出した容量/サイズ
+                            'メーカー': page_data.get('manufacturer', 'N/A'),
+                            '数量': product_info['Quantity'],
+                            '単位': product_info['Unit'],
+                            'リスト単価': price,
+                            '合計金額': price * product_info['Quantity'],
+                            '在庫': 'あり' if offer_item.get('inStock') else 'なし/不明',
+                            '情報元URL': page_data.get('sourceUrl', 'N/A')
+                        })
+            
+            if not final_results:
+                st.warning("検索結果から有効な製品情報が見つかりませんでした。")
+                query_for_url = f"{product_info.get('Manufacturer', '')} {product_info.get('ProductName', '')}"
+                final_results.append({
+                    '入力日': input_date, '製品名': product_info['ProductName'], '型番/製品番号': 'N/A',
+                    '仕様': 'N/A', 'メーカー': product_info['Manufacturer'], '数量': product_info['Quantity'],
+                    '単位': product_info['Unit'], 'リスト単価': 0, '合計金額': 0, '在庫': 'なし/不明',
+                    '情報元URL': f"https://www.google.com/search?q={urllib.parse.quote(query_for_url)}"
+                })
+            
+            st.success("全製品の情報収集が完了しました。")
+
+            if final_results:
+                df_results = pd.DataFrame(final_results)
+                if max_price_input > 0:
+                    df_results = df_results[df_results['リスト単価'] <= max_price_input]
+                if min_price_input > 0:
+                    df_results = df_results[df_results['リスト単価'] >= min_price_input]
+
+                st.subheader("検索結果")
+                st.dataframe(
+                    df_results,
+                    column_config={
+                        "リスト単価": st.column_config.NumberColumn(format="¥%d"),
+                        "合計金額": st.column_config.NumberColumn(format="¥%d"),
+                        "情報元URL": st.column_config.LinkColumn("Link", display_text="開く")
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                @st.cache_data
+                def convert_df_to_csv(df):
+                    return df.to_csv(index=False).encode('utf-8-sig')
+
+                csv = convert_df_to_csv(df_results)
+                st.download_button(
+                    label="結果をCSVでダウンロード",
+                    data=csv,
+                    file_name=f"purchase_list_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                    mime='text/csv',
+                )
