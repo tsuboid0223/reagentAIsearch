@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-
-指定された製品名に基づき、試薬会社サイトから製品情報をウェブスクレイピングし、
-価格、在庫状況などを一覧で表示します。
-Bright DataプロキシとGemini APIを利用して、高度な情報抽出を実現します。
+（Secrets認証による最終確定版）
 """
 
 # ==============================================================================
@@ -19,7 +16,7 @@ from bs4 import BeautifulSoup
 import json
 import concurrent.futures
 
-# urllib3のSSL証明書警告を非表示にする (プロキシ利用時に発生することがあるため)
+# urllib3のSSL証明書警告を非表示にする
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -27,26 +24,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # === Bright Data API 連携関数 ===
 # ==============================================================================
 
-def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
+def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Bright Dataのプロキシマネージャーを経由してHTMLを取得し、結果を辞書で返す。
-    高度なボット対策が施されたサイトに対して最も効果的な方法。
-
-    Args:
-        url (str): 取得対象のURL。
-        api_key (str): Bright DataのAPIキー (プロキシのパスワードとして使用)。
-
-    Returns:
-        dict: 取得結果を含む辞書 (URL, ステータスコード, HTMLコンテンツ, エラー情報など)。
+    [最終修正] Streamlit Secretsから渡された認証情報を使ってプロキシ経由でHTMLを取得する。
     """
-    # ### あなたのBright Data接続情報 ###
     BRD_HOST = 'brd.superproxy.io'
     BRD_PORT = 22225
-    BRD_USERNAME = 'brd-customer-hl_3c49a4bb-zone-scraping_browser1'
-    BRD_PASSWORD = api_key  # st.secretsから渡されたAPIキーをパスワードとして使用
-    # ### 設定完了 ###
-
-    proxy_url = f'http://{BRD_USERNAME}:{BRD_PASSWORD}@{BRD_HOST}:{BRD_PORT}'
+    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
@@ -68,16 +52,6 @@ def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
 
 
 def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
-    """
-    Bright DataのSERP APIを利用してGoogle検索を実行し、検索結果のURLリストを取得する。
-
-    Args:
-        query (str): 検索クエリ。
-        api_key (str): Bright DataのAPIキー。
-
-    Returns:
-        list: 抽出されたURLのリスト。
-    """
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
     google_search_url = f"https://www.google.co.jp/search?q={urllib.parse.quote(query)}&hl=ja&gl=jp&ceid=JP:ja"
@@ -87,9 +61,7 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
         initial_response = requests.post('https://api.brightdata.com/serp/req', headers=headers, json=payload, timeout=30)
         initial_response.raise_for_status()
         response_id = initial_response.headers.get('x-response-id')
-        if not response_id:
-            st.error("エラー: SERP APIからのresponse_idが取得できませんでした。")
-            return []
+        if not response_id: return []
         
         result_url = f'https://api.brightdata.com/serp/get_result?response_id={response_id}'
         for _ in range(15):
@@ -103,37 +75,21 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
                     unique_urls = list(dict.fromkeys(urls))
                     st.success(f"【Bright Data】「{query}」から{len(unique_urls)}件のURLを抽出しました。")
                     return unique_urls
-                elif result_response.status_code != 202:
-                    return []
+                elif result_response.status_code != 202: return []
             except requests.exceptions.RequestException: return []
         return []
-    except requests.exceptions.RequestException:
-        st.error(f"Bright Data APIの初期呼び出しエラー")
-        return []
+    except requests.exceptions.RequestException: return []
 
 # ==============================================================================
 # === AIエージェント関連関数 ===
 # ==============================================================================
 
 def is_blocked_page(html_content: str) -> bool:
-    """HTMLコンテンツがセキュリティシステムにブロックされているかを判定する。"""
     if not html_content: return False
     block_keywords = ["cloudflare", "access denied", "site is protected", "checking your browser", "captcha", "are you a human", "アクセスが拒否されました"]
-    lower_content = html_content.lower()
-    return any(keyword in lower_content for keyword in block_keywords)
+    return any(keyword in html_content.lower() for keyword in block_keywords)
 
 def analyze_page_and_extract_info(page_content_result: dict, product_name: str, gemini_api_key: str) -> dict | None:
-    """
-    HTMLコンテンツをGemini APIに渡し、製品情報を抽出する。
-
-    Args:
-        page_content_result (dict): get_page_content_with_brightdataからの取得結果。
-        product_name (str): 探している製品名。
-        gemini_api_key (str): Gemini APIのキー。
-
-    Returns:
-        dict | None: 抽出された製品情報の辞書。失敗時はNone。
-    """
     html_content = page_content_result.get("content")
     if page_content_result.get("error") or not html_content or is_blocked_page(html_content):
         return None
@@ -146,6 +102,10 @@ def analyze_page_and_extract_info(page_content_result: dict, product_name: str, 
     if not body_text: return None
     if len(body_text) > 18000: body_text = body_text[:18000]
 
+    prompt = f"""
+    You are an Analyst Agent... (省略)
+    """
+    # (プロンプトは変更なし)
     prompt = f"""
     You are an Analyst Agent. Your task is to analyze the following text content from a product webpage and extract key information about the specified product.
     **Product to find:** "{product_name}"
@@ -174,54 +134,41 @@ def analyze_page_and_extract_info(page_content_result: dict, product_name: str, 
 # ==============================================================================
 # === 統括エージェント ===
 # ==============================================================================
-def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, preferred_sites: list) -> tuple[list, list]:
-    """
-    一連の処理を統括するエージェント。検索、スクレイピング、情報抽出を実行する。
-    """
+def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, brd_username: str, brd_password: str, preferred_sites: list) -> tuple[list, list]:
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
     st.subheader(f"【統括エージェント】 \"{product_name}\" の情報収集を開始します。")
 
-    # 検索クエリの準備
     base_query = f"{manufacturer} {product_name}"
     site_map = { 'コスモバイオ': 'cosmobio.co.jp', 'フナコシ': 'funakoshi.co.jp', 'AXEL': 'axel.as-1.co.jp', 'Selleck': 'selleck.co.jp', 'MCE': 'medchemexpress.com', 'Nakarai': 'nacalai.co.jp', 'FUJIFILM': 'labchem-wako.fujifilm.com', '関東化学': 'kanto.co.jp', 'TCI': 'tcichemicals.com', 'Merck': 'merck.com', '和光純薬': 'hpc-j.co.jp' }
     search_queries = [f"site:{site_map[site_name]} {base_query}" for site_name in preferred_sites if site_name in site_map]
     search_queries.append(base_query)
 
-    # URLリストの取得
     all_urls = []
     for query in search_queries:
         all_urls.extend(search_product_urls_with_brightdata(query, brightdata_api_key))
     
     unique_urls = list(dict.fromkeys(all_urls))
-    if not unique_urls:
-        st.warning("関連するWebページのURLが見つかりませんでした。")
-        return [], []
+    if not unique_urls: return [], []
     
     st.info(f"{len(unique_urls)}件のHTMLページを並列で取得・分析します...")
     my_bar = st.progress(0, text="Webページを取得中...")
-    
-    all_page_content_results = []
-    found_pages_data = []
+    all_page_content_results, found_pages_data = [], []
 
-    # 並列処理
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        # Step 1: 全ページのHTMLコンテンツ取得を並列実行
-        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brightdata_api_key): url for url in unique_urls}
+        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
             my_bar.progress((i + 1) / len(unique_urls), text=f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
 
-        # Step 2: 取得成功したコンテンツだけをAIで並列分析
         successful_contents = [res for res in all_page_content_results if res.get("content") and not res.get("error") and not is_blocked_page(res.get("content"))]
         if successful_contents:
             my_bar.progress(0, text="AIでページを分析中...")
             future_to_content = {executor.submit(analyze_page_and_extract_info, content_res, product_name, gemini_api_key): content_res for content_res in successful_contents}
             for i, future in enumerate(concurrent.futures.as_completed(future_to_content)):
-                content_res = future_to_content[future]
                 page_details = future.result()
                 if page_details and page_details.get("offers"):
-                    page_details['sourceUrl'] = content_res.get("url")
+                    page_details['sourceUrl'] = future_to_content[future].get("url")
                     found_pages_data.append(page_details)
                 my_bar.progress((i + 1) / len(successful_contents), text=f"AIでページを分析中... ({i + 1}/{len(successful_contents)})")
 
@@ -234,15 +181,16 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
 st.set_page_config(layout="wide")
 st.title("製品調達AIエージェント")
 
-# --- サイドバー ---
 st.sidebar.header("APIキー設定")
 try:
     gemini_api_key = st.secrets["GOOGLE_API_KEY"]
     brightdata_api_key = st.secrets["BRIGHTDATA_API_KEY"]
-    st.sidebar.success("APIキーが設定されています。")
+    brightdata_username = st.secrets["BRIGHTDATA_USERNAME"]
+    brightdata_password = st.secrets["BRIGHTDATA_PASSWORD"]
+    st.sidebar.success("APIキーと認証情報が設定されています。")
 except KeyError:
-    st.sidebar.error("StreamlitにAPIキーが設定されていません。")
-    gemini_api_key, brightdata_api_key = "", ""
+    st.sidebar.error("Streamlit Secretsに全ての情報が設定されていません。")
+    gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password = "", "", "", ""
 
 st.sidebar.header("検索条件")
 product_name_input = st.sidebar.text_input("製品名 (必須)", placeholder="例: Y27632")
@@ -252,21 +200,17 @@ max_price_input = st.sidebar.number_input("最高価格 (円)", min_value=0, val
 debug_mode_checkbox = st.sidebar.checkbox("デバッグモードを有効にする (詳細ログ表示)")
 search_button = st.sidebar.button("検索開始", type="primary")
 
-# --- メインコンテンツ ---
 if search_button:
-    if not gemini_api_key or not brightdata_api_key:
-        st.error("APIキーが設定されていません。")
+    if not all([gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password]):
+        st.error("APIキーまたは認証情報が設定されていません。")
     elif not product_name_input:
         st.error("製品名を入力してください。")
     else:
         with st.spinner('AIエージェントが情報収集中...'):
             product_info = {'ProductName': product_name_input, 'Manufacturer': manufacturer_input}
             preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
+            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password, preferred_sites)
             
-            # エージェント実行
-            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites)
-            
-            # 結果を整形
             final_results = []
             input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
             if pages_list:
@@ -274,14 +218,8 @@ if search_button:
                     for offer_item in page_data.get('offers', []):
                         try: price = int(float(offer_item.get('price', 0)))
                         except (ValueError, TypeError): price = 0
-                        final_results.append({
-                            '入力日': input_date, '製品名': page_data.get('productName', 'N/A'),
-                            '型番/製品番号': page_data.get('modelNumber', 'N/A'), '仕様': offer_item.get('size', 'N/A'),
-                            'メーカー': page_data.get('manufacturer', 'N/A'), 'リスト単価': price,
-                            '在庫': 'あり' if offer_item.get('inStock') else 'なし/不明', '情報元URL': page_data.get('sourceUrl', 'N/A')
-                        })
+                        final_results.append({ '入力日': input_date, '製品名': page_data.get('productName', 'N/A'), '型番/製品番号': page_data.get('modelNumber', 'N/A'), '仕様': offer_item.get('size', 'N/A'), 'メーカー': page_data.get('manufacturer', 'N/A'), 'リスト単価': price, '在庫': 'あり' if offer_item.get('inStock') else 'なし/不明', '情報元URL': page_data.get('sourceUrl', 'N/A') })
             
-            # 結果が0件の場合のフォールバック
             if not final_results:
                 st.warning("検索結果から有効な製品情報が見つかりませんでした。")
                 search_term = f"{product_info.get('Manufacturer', '')} {product_info['ProductName']}"
@@ -290,7 +228,6 @@ if search_button:
             
             st.success("全製品の情報収集が完了しました。")
 
-            # データフレーム作成と表示
             df_results = pd.DataFrame(final_results)
             if max_price_input > 0: df_results = df_results[df_results['リスト単価'] <= max_price_input]
             if min_price_input > 0: df_results = df_results[df_results['リスト単価'] >= min_price_input]
@@ -298,32 +235,23 @@ if search_button:
             st.subheader("検索結果")
             st.dataframe( df_results, column_config={ "リスト単価": st.column_config.NumberColumn(format="¥%d"), "情報元URL": st.column_config.LinkColumn("Link", display_text="開く") }, use_container_width=True, hide_index=True )
             
-            # CSVダウンロード
             @st.cache_data
             def convert_df_to_csv(df: pd.DataFrame) -> bytes: return df.to_csv(index=False).encode('utf-8-sig')
             csv = convert_df_to_csv(df_results)
             st.download_button( label="結果をCSVでダウンロード", data=csv, file_name=f"purchase_list_{pd.Timestamp.now().strftime('%Y%m%d')}.csv", mime='text/csv' )
 
-        # デバッグログの表示
         if debug_mode_checkbox and log_data:
             st.subheader("詳細デバッグログ")
             for log in log_data:
-                status = log.get('status_code')
-                is_error = log.get('error') is not None
-                is_blocked = is_blocked_page(log.get("content", ""))
+                status, is_error, is_blocked = log.get('status_code'), log.get('error') is not None, is_blocked_page(log.get("content", ""))
                 
-                if is_error:
-                    st.error(f"接続エラー: {log['url']}")
-                elif is_blocked:
-                    st.warning(f"ブロック検知: {log['url']}")
-                elif status != 200 and status is not None:
-                     st.warning(f"ステータスコード異常 ({status}): {log['url']}")
-                else:
-                    st.success(f"取得成功 ({status}): {log['url']}")
+                if is_error: st.error(f"接続エラー: {log['url']}")
+                elif is_blocked: st.warning(f"ブロック検知: {log['url']}")
+                elif status != 200 and status is not None: st.warning(f"ステータスコード異常 ({status}): {log['url']}")
+                else: st.success(f"取得成功 ({status}): {log['url']}")
 
                 with st.expander("詳細を表示"):
                     if is_error: st.write(f"**エラー内容:** {log['error']}")
                     log_display = log.copy()
-                    if log_display.get('content'):
-                        log_display['content'] = log_display['content'][:1000] + "..." if log_display['content'] else ""
+                    if log_display.get('content'): log_display['content'] = (log_display['content'][:1000] + "...") if log_display['content'] else ""
                     st.json(log_display)
