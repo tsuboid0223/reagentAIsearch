@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（API呼び出し回帰・最終デバッグ版）
+（APIエンドポイント修正・最終確定版）
 """
 
 # ==============================================================================
@@ -26,8 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
     """
-    [最終修正] Scraping Browser APIを直接呼び出す方式に戻す。
-    認証失敗の原因を特定するため、エラーレスポンスを詳細に記録する。
+    [最終修正] 正しいScraping Browser APIエンドポイントを呼び出す。
     """
     headers = {'Authorization': f'Bearer {api_key}'}
     brightdata_zone_name = 'scraping_browser1'
@@ -35,7 +34,8 @@ def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
     result = {"url": url, "status_code": None, "headers": None, "content": None, "error": None}
 
     try:
-        initial_response = requests.post('https://api.brightdata.com/scraping/browser/request', headers=headers, json=payload, timeout=40)
+        # [修正点] 正しいAPIエンドポイントURLに変更
+        initial_response = requests.post('https://api.brightdata.com/v2/browser/request', headers=headers, json=payload, timeout=40)
         result['status_code'] = initial_response.status_code
         initial_response.raise_for_status()
         response_id = initial_response.headers.get('x-response-id')
@@ -44,7 +44,8 @@ def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
             result['content'] = initial_response.text
             return result
 
-        result_url = f'https://api.brightdata.com/scraping/browser/response?response_id={response_id}'
+        # [修正点] 正しいAPIエンドポイントURLに変更
+        result_url = f'https://api.brightdata.com/v2/browser/response?response_id={response_id}'
         for _ in range(15):
             time.sleep(3)
             result_response = requests.get(result_url, headers=headers, timeout=30)
@@ -117,10 +118,6 @@ def analyze_page_and_extract_info(page_content_result: dict, product_name: str, 
     if not body_text: return None
     if len(body_text) > 18000: body_text = body_text[:18000]
 
-    prompt = f"""
-    You are an Analyst Agent... (省略)
-    """
-    # (プロンプトは変更なし)
     prompt = f"""
     You are an Analyst Agent. Your task is to analyze the following text content from a product webpage and extract key information about the specified product.
     **Product to find:** "{product_name}"
