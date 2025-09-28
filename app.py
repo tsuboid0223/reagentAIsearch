@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（Web Scraper IDE利用・構文エラー修正済み最終版）
+（Collection ID対応・最終確定版）
 """
 
 # ==============================================================================
@@ -26,6 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
     """
     Web Scraper IDEを呼び出し、指定URLのHTML取得を依頼する。
+    応答本文からcollection_idを取得する。
     """
     COLLECTOR_ID = "c_mg3jlmpr1cgbrr3g1t"
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
@@ -39,24 +40,29 @@ def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
         result['status_code'] = response.status_code
         response.raise_for_status()
 
-        response_id = response.headers.get('x-response-id')
+        # [最終修正] 応答本文(JSON)からcollection_idを取得する
+        response_id = response.json().get('collection_id')
+        
         if not response_id:
-            result['error'] = 'Failed to get response ID from trigger'
+            result['error'] = 'Failed to get collection_id from trigger response body.'
             result['content'] = response.text
             return result
         
         for _ in range(20):
             time.sleep(3)
-            status_response = requests.get(f"https://api.brightdata.com/dca/status?id={response_id}", headers=headers)
+            # [最終修正] collection_idを使ってステータスを確認
+            status_response = requests.get(f"https://api.brightdata.com/dca/collections/{response_id}", headers=headers)
             status_data = status_response.json()
             if status_data.get('status') == 'done':
-                result_response = requests.get(f"https://api.brightdata.com/dca/get_result?response_id={response_id}", headers=headers)
+                # [最終修正] collection_idを使って結果を取得
+                result_response = requests.get(f"https://api.brightdata.com/dca/collections/{response_id}/stream", headers=headers)
                 result['status_code'] = result_response.status_code
                 
+                # 結果はNDJSON形式で返ってくるため、最初の行を解析する
                 first_line = result_response.text.splitlines()[0]
                 result_data = json.loads(first_line)
 
-                if result_data and isinstance(result_data, dict) and 'body' in result_data:
+                if result_data and 'body' in result_data:
                     result['content'] = result_data['body']
                 return result
         
@@ -100,9 +106,11 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
         return []
     except requests.exceptions.RequestException: return []
 
+# (以降のAIエージェント関連関数、統括エージェント、Streamlit UI部分は変更ありません)
 # ==============================================================================
 # === AIエージェント関連関数 ===
 # ==============================================================================
+
 def analyze_page_and_extract_info(page_content_result: dict, product_name: str, gemini_api_key: str) -> dict | None:
     """HTMLをGemini APIに渡し、製品情報を抽出する。"""
     html_content = page_content_result.get("content")
@@ -257,7 +265,6 @@ if search_button:
                 status, is_error = log.get('status_code'), log.get('error') is not None
                 
                 if is_error: st.error(f"接続エラー: {log['url']}")
-                # [修正点] 構文エラーを修正
                 elif status != 200 and status is not None:
                     st.warning(f"ステータスコード異常 ({status}): {log['url']}")
                 else:
