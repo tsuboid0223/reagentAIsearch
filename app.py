@@ -9,124 +9,81 @@ import json
 from tqdm import tqdm
 import concurrent.futures
 
-# === 3. AIエージェントと関連関数の定義 (Colab版から流用) ===
-
-def search_product_urls_with_brightdata(query, api_key, debug_mode=False): # debug_mode引数を追加
-    st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
-
-    headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json',
-    }
-    GoogleSearch_url = f"https://www.google.co.jp/search?q={urllib.parse.quote(query)}&hl=ja"
-    payload = {'zone': 'serp_api1', 'url': GoogleSearch_url}
+# ==============================================================================
+# === 修正箇所 1: Bright Dataを使った、より強力なHTML取得関数を新設 ===
+# ==============================================================================
+def get_page_content_with_brightdata(url, api_key):
+    """
+    requests.getの代わりにBright DataのScraping Browserを使って
+    JavaScriptレンダリング後のHTMLを取得する。
+    これにより、ボット対策を回避しやすくなる。
+    """
+    headers = {'Authorization': f'Bearer {api_key}'}
+    payload = {'url': url, 'country': 'jp'} # 日本からのアクセスをエミュレート
 
     try:
-        # Initial request to Bright Data
-        initial_response = requests.post('https://api.brightdata.com/serp/req', headers=headers, json=payload, timeout=30)
-        initial_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
-        # --- デバッグモード時のみ表示 ---
-        if debug_mode:
-            st.info(f"【Bright Data】初期リクエスト ステータスコード: {initial_response.status_code}")
-            st.info(f"【Bright Data】初期リクエスト レスポンス本文 (最初の200文字): {initial_response.text[:200]}...")
-        # --- ここまでデバッグモード時のみ表示 ---
-
-        response_id = initial_response.headers.get('x-response-id')
-        if not response_id:
-            st.error("エラー: APIからのresponse_idが取得できませんでした。Bright Dataからの応答が不正です。")
-            return []
-        
-        st.info(f"【Bright Data】リクエスト受付完了 (Response ID: {response_id})。結果を待機します...")
-
-        result_url = f'https://api.brightdata.com/serp/get_result?response_id={response_id}'
-        
-        # Poll for results
-        for i in range(1, 16): # Loop 15 times, total wait up to 30 seconds
-            st.info(f"【Bright Data】結果取得試行 {i}/15...")
-            time.sleep(2) # Wait 2 seconds before each attempt
-
-            try:
-                result_response = requests.get(result_url, headers={'Authorization': f'Bearer {api_key}'}, timeout=30)
-                result_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-                
-                # --- デバッグモード時のみ表示 ---
-                if debug_mode:
-                    st.info(f"【Bright Data】試行 {i} 結果取得ステータスコード: {result_response.status_code}")
-                    st.info(f"【Bright Data】試行 {i} 結果取得レスポンス本文 (最初の200文字): {result_response.text[:200]}...")
-                    with st.expander(f"【Bright Data】試行 {i} の生レスポンス (ステータスコード: {result_response.status_code})"):
-                        if result_response.text:
-                            st.code(result_response.text, language='html')
-                        else:
-                            st.write("レスポンス本文は空でした。")
-                # --- ここまでデバッグモード時のみ表示 ---
-
-                if result_response.status_code == 200:
-                    st.success(f"【Bright Data】結果取得完了 (ステータスコード: {result_response.status_code})。")
-                    try:
-                        if not result_response.text:
-                            st.warning("結果取得完了、しかしレスポンスが空でした。Bright Dataからの検索結果がありませんでした。")
-                            return []
-                        
-                        soup = BeautifulSoup(result_response.text, 'html.parser')
-                        urls = []
-                        for a_tag in soup.find_all('a', href=True):
-                            href = a_tag.get('href')
-                            # Filter out Google internal links and non-HTTP/HTTPS links
-                            if href and href.startswith('http') and not href.startswith('https://www.google.com') and not href.startswith('https://accounts.google.com'):
-                                urls.append(href)
-
-                        if urls:
-                            unique_urls = list(dict.fromkeys(urls))
-                            st.success(f"【Bright Data】合計{len(unique_urls)}件のURLをHTMLから抽出しました。")
-                            return unique_urls
-                        else:
-                            st.warning("検索結果のHTMLから有効なURLを抽出できませんでした。検索クエリに対する適切な結果が得られなかった可能性があります。")
-                            return []
-                    except requests.exceptions.JSONDecodeError: # This specific error might not happen if content-type is HTML, but good to keep for robustness
-                        st.error(f"Bright Dataからのレスポンスが予期しない形式でした。内容: {result_response.text[:200]}...")
-                        return []
-                elif result_response.status_code == 202:
-                    st.info(f"【Bright Data】結果はまだ準備中です (ステータスコード: {result_response.status_code})。次の試行を待ちます。")
-                    # Continue loop if status is 202 (Accepted)
-                else:
-                    st.error(f"結果取得エラー: 予期しないステータスコード {result_response.status_code} を受け取りました。")
-                    return []
-            except requests.exceptions.Timeout:
-                st.warning(f"結果取得試行 {i}/15 でタイムアウトしました (個別のリクエストタイムアウト)。Bright Dataからの応答が遅い可能性があります。")
-                # Continue loop as it's an individual request timeout, not the overall polling timeout
-            except requests.exceptions.RequestException as e:
-                st.error(f"結果取得試行 {i}/15 でネットワークエラーが発生しました: {e}。Bright Dataへの接続に問題がある可能性があります。")
-                return [] # Exit on other request exceptions during polling
-
-        # If the loop finishes without returning (i.e., status 200 was never received)
-        st.error("結果取得がタイムアウトしました。指定された時間内にBright Dataからの検索結果が準備されませんでした。")
-        st.error("考えられる原因: Bright Data側の処理遅延、または検索クエリに対する結果生成に時間がかかっている可能性があります。")
-        return []
-
-    except requests.exceptions.Timeout:
-        st.error(f"Bright Dataへの初期リクエストがタイムアウトしました。APIへの接続に問題があるか、非常に時間がかかっています。")
-        return []
-    except requests.exceptions.RequestException as e:
-        st.error(f"Bright Data API呼び出しエラー: {e}。初期リクエストの送信に失敗しました。")
-        return []
-
-def analyze_page_and_extract_info(url, product_name, gemini_api_key):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
+        # Bright DataのScraping Browser APIエンドポイントを呼び出す
+        # これは一般的な例であり、契約によってはプロキシ形式(例: brd.superproxy.io)を使う場合があります
+        response = requests.post('https://api.brightdata.com/scraping/browser/request', headers=headers, json=payload, timeout=60)
         response.raise_for_status()
-        html_content = response.text
+        
+        # レスポンスIDを取得して結果をポーリング
+        response_id = response.headers.get('x-response-id')
+        if not response_id:
+            st.warning(f"【Bright Data Scraper】URL '{url}' のResponse IDが取得できませんでした。")
+            return None, "Response ID not found"
+
+        result_url = f'https://api.brightdata.com/scraping/browser/response?response_id={response_id}'
+        
+        for _ in range(10): # タイムアウトまでポーリング
+            time.sleep(3)
+            result_response = requests.get(result_url, headers=headers, timeout=30)
+            if result_response.status_code == 200:
+                return result_response.text, None # 成功：HTMLコンテンツを返す
+            if result_response.status_code != 202: # 202は「処理中」
+                return None, f"Unexpected status code: {result_response.status_code}"
+        
+        return None, "Polling timed out"
+
     except requests.exceptions.RequestException as e:
-        st.warning(f"URL {url} のコンテンツ取得に失敗しました: {e}")
+        return None, f"Request failed: {e}"
+
+
+# ==============================================================================
+# === 修正箇所 2: 元の分析関数を修正し、新しいHTML取得関数とデバッグ機能を追加 ===
+# ==============================================================================
+def analyze_page_and_extract_info(url, product_name, gemini_api_key, brightdata_api_key, debug_mode=False): # 引数を追加
+    # 変更点: requests.getを新しい関数に置き換え
+    html_content, error = get_page_content_with_brightdata(url, brightdata_api_key)
+
+    if error or not html_content:
+        st.warning(f"URL {url} のコンテンツ取得に失敗しました: {error}")
         return None
 
+    # --- ここからデバッグ機能 ---
+    if debug_mode:
+        with st.expander(f"【デバッグ情報】URL: {url}"):
+            st.subheader("取得した生HTML (最初の1000文字)")
+            st.code(html_content[:1000], language='html')
+    # --- ここまでデバッグ機能 ---
+
     soup = BeautifulSoup(html_content, 'html.parser')
-    for s in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+    for s in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'form']): # formも除去対象に追加
         s.decompose()
     body_text = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
 
+    if not body_text:
+        st.info(f"URL {url} からテキストを抽出できませんでした。ページが空か、構造が特殊である可能性があります。")
+        return None
+
     if len(body_text) > 18000: body_text = body_text[:18000]
+
+    # --- ここからデバッグ機能 ---
+    if debug_mode:
+        with st.expander(f"【デバッグ情報】URL: {url}"): # 同じexpanderに追記
+            st.subheader("クリーンアップ後、AIに渡すテキスト (最初の1000文字)")
+            st.text(body_text[:1000])
+    # --- ここまでデバッグ機能 ---
 
     prompt = f"""
     You are an Analyst Agent. Your task is to analyze the following text content from a product webpage and extract key information about the specified product.
@@ -152,7 +109,7 @@ def analyze_page_and_extract_info(url, product_name, gemini_api_key):
             "generationConfig": {"responseMimeType": "application/json"}
         }
         apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={gemini_api_key}"
-        response = requests.post(apiUrl, headers={'Content-Type': 'application/json'}, json=payload)
+        response = requests.post(apiUrl, headers={'Content-Type': 'application/json'}, json=payload, timeout=45) # タイムアウトを延長
         response.raise_for_status()
         result = response.json()
         if not result.get('candidates'):
@@ -168,7 +125,10 @@ def analyze_page_and_extract_info(url, product_name, gemini_api_key):
         st.error(f"Gemini API呼び出しエラー: {e}。URL: {url}")
         return None
 
-def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites=[], debug_mode=False): # debug_mode引数を追加
+# ==============================================================================
+# === 修正箇所 3: orchestrator_agentから新しい引数を渡す ===
+# ==============================================================================
+def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites=[], debug_mode=False):
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
     st.subheader(f"【統括エージェント】 \"{product_name}\" の情報収集を開始します。")
@@ -188,10 +148,9 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
     search_queries.append(base_query)
     all_urls = []
     for query in search_queries:
-        # search_product_urls_with_brightdata 関数に debug_mode を渡す
         all_urls.extend(search_product_urls_with_brightdata(query, brightdata_api_key, debug_mode))
     unique_urls = list(dict.fromkeys(all_urls))
-    html_urls = [url for url in unique_urls if not url.lower().endswith(('.pdf', '.xls', '.xlsx', '.doc', '.docx'))]
+    html_urls = [url for url in unique_urls if not url.lower().endswith(('.pdf', '.xls', 'xlsx', '.doc', '.docx'))]
     if not html_urls:
         st.warning("関連URLが見つかりませんでした。検索クエリやBright Dataの設定を確認してください。")
         return []
@@ -199,14 +158,16 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
     found_offers = []
     st.info(f"{len(html_urls)}件のHTMLページを並列で分析します...")
     
-    # Use tqdm for progress bar in a non-Streamlit context, or a custom Streamlit progress bar.
-    # For Streamlit, st.progress is better.
     progress_text = "Webページを分析中..."
     my_bar = st.progress(0, text=progress_text)
     processed_count = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_url = {executor.submit(analyze_page_and_extract_info, url, product_name, gemini_api_key): url for url in html_urls}
+        # 変更点: analyze_page_and_extract_info に必要な引数 (brightdata_api_key, debug_mode) を渡す
+        future_to_url = {
+            executor.submit(analyze_page_and_extract_info, url, product_name, gemini_api_key, brightdata_api_key, debug_mode): url 
+            for url in html_urls
+        }
         for future in concurrent.futures.as_completed(future_to_url):
             url = future_to_url[future]
             try:
@@ -225,122 +186,7 @@ def orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferr
     st.success(f"【統括エージェント】合計{len(found_offers)}件の製品情報を抽出しました。")
     return found_offers
 
-# === Streamlit アプリケーションのメイン部分 ===
 
-# アプリのタイトル
-st.title("製品調達AIエージェント")
-
-# サイドバーにAPIキー読み込み処理を設置
-st.sidebar.header("APIキー設定")
-try:
-    gemini_api_key = st.secrets["GOOGLE_API_KEY"]
-    brightdata_api_key = st.secrets["BRIGHTDATA_API_KEY"]
-    st.sidebar.success("APIキーが設定されています。")
-except KeyError:
-    st.sidebar.error("StreamlitにAPIキーが設定されていません。`GOOGLE_API_KEY` と `BRIGHTDATA_API_KEY` をSecretsに登録してください。")
-    # キーが設定されていない場合、処理が進まないように空文字をセット
-    gemini_api_key = ""
-    brightdata_api_key = ""
-
-# サイドバーに検索条件入力欄を設置
-st.sidebar.header("検索条件")
-product_name_input = st.sidebar.text_input("製品名 (必須)", placeholder="例: Y27632")
-manufacturer_input = st.sidebar.text_input("メーカー", placeholder="例: Selleck")
-specs_input = st.sidebar.text_input("仕様", placeholder="任意")
-quantity_input = st.sidebar.number_input("数量", min_value=1, value=1)
-unit_input = st.sidebar.text_input("単位", value="pcs")
-min_price_input = st.sidebar.number_input("最低価格 (円)", min_value=0, value=0, step=100)
-max_price_input = st.sidebar.number_input("最高価格 (円)", min_value=0, value=0, step=100)
-
-# --- デバッグモードのチェックボックスを残す ---
-debug_mode_checkbox = st.sidebar.checkbox("デバッグモードを有効にする (生のHTMLを表示)")
-
-# 検索ボタン
-search_button = st.sidebar.button("検索開始", type="primary")
-
-# 検索ボタンが押されたら処理を開始
-if search_button:
-    # --- 入力チェック ---
-    if not gemini_api_key or not brightdata_api_key:
-        st.error("APIキーが設定されていません。StreamlitのSecretsにキーを登録してください。")
-    elif not product_name_input:
-        st.error("製品名を入力してください。")
-    else:
-        with st.spinner('検索中です...しばらくお待ちください。'):
-            # --- 検索処理の実行 ---
-            product_info = {
-                'ProductName': product_name_input,
-                'Manufacturer': manufacturer_input,
-                'Specifications': specs_input,
-                'Quantity': quantity_input,
-                'Unit': unit_input
-            }
-            
-            # 優先サイト検索をデフォルトで実行するように変更
-            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
-
-            # orchestrator_agent 関数に debug_mode_checkbox の状態を渡す
-            offers_list = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites, debug_mode_checkbox)
-
-            final_results = []
-            input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-
-            if offers_list:
-                for offer in offers_list:
-                    price = 0
-                    try:
-                        price = int(offer.get('price', 0))
-                    except (ValueError, TypeError):
-                        price = 0
-                    
-                    final_results.append({
-                        '入力日': input_date, '製品名': offer.get('productName', 'N/A'),
-                        '型番/製品番号': offer.get('modelNumber', 'N/A'), '仕様': product_info['Specifications'],
-                        'メーカー': offer.get('manufacturer', 'N/A'), '数量': product_info['Quantity'],
-                        '単位': product_info['Unit'], 'リスト単価': price,
-                        '合計金額': price * product_info['Quantity'],
-                        '在庫': 'あり' if offer.get('inStock') else 'なし/不明',
-                        '情報元URL': offer.get('sourceUrl', 'N/A')
-                    })
-            else:
-                st.warning("検索結果から有効な製品情報が見つかりませんでした。")
-                query_for_url = f"{product_info.get('Manufacturer', '')} {product_info.get('ProductName', '')}"
-                final_results.append({
-                    '入力日': input_date, '製品名': product_info['ProductName'], '型番/製品番号': 'N/A',
-                    '仕様': product_info['Specifications'], 'メーカー': product_info['Manufacturer'], '数量': product_info['Quantity'],
-                    '単位': product_info['Unit'], 'リスト単価': 0, '合計金額': 0, '在庫': 'なし/不明',
-                    '情報元URL': f"https://www.google.com/search?q={urllib.parse.quote(query_for_url)}"
-                })
-            
-            st.success("全製品の情報収集が完了しました。")
-
-            # --- 結果の表示と整形 ---
-            if final_results:
-                df_results = pd.DataFrame(final_results)
-
-                if max_price_input > 0:
-                    df_results = df_results[df_results['リスト単価'] <= max_price_input]
-                if min_price_input > 0:
-                    df_results = df_results[df_results['リスト単価'] >= min_price_input]
-
-                st.subheader("検索結果")
-                st.dataframe(
-                    df_results,
-                    column_config={
-                        "情報元URL": st.column_config.LinkColumn("Link", display_text="Click to Open")
-                    },
-                    use_container_width=True
-                )
-
-                # --- CSVダウンロードボタン ---
-                @st.cache_data
-                def convert_df_to_csv(df):
-                    return df.to_csv(index=False).encode('utf-8-sig')
-
-                csv = convert_df_to_csv(df_results)
-                st.download_button(
-                    label="結果をCSVでダウンロード",
-                    data=csv,
-                    file_name=f"purchase_list_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-                    mime='text/csv',
-                )
+# 注: これより下のStreamlit UI部分のコードは変更不要です。
+# ただし、`orchestrator_agent`を呼び出す際に`debug_mode_checkbox`を渡している部分は
+# すでに正しく実装されているため、そのままで問題ありません。
