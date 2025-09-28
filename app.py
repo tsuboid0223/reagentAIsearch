@@ -21,6 +21,7 @@ import json
 import concurrent.futures
 import urllib3
 
+# urllib3のSSL証明書警告を非表示にする
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
@@ -39,10 +40,12 @@ def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
     Returns:
         dict: 取得結果を含む辞書 (URL, ステータスコード, HTMLコンテンツ, エラー情報など)。
     """
-    # [修正点] あなたのWeb Scraper IDEのCollector IDを反映
+    # ### ▼▼▼ ここをあなたのIDに書き換えてください ▼▼▼ ###
+    # Bright Dataの管理画面で作成したWeb Scraper IDEの「Collector ID」
     COLLECTOR_ID = "c_mg3jlmpr1cgbrr3g1t"
+    # ### ▲▲▲ 設定ここまで ▲▲▲ ###
     
-    headers = {'Authorization': f'Bearer {api_key}'}
+    headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
     payload = [{'url': url, 'country': 'jp'}] 
     result = {"url": url, "status_code": None, "content": None, "error": None}
 
@@ -54,9 +57,12 @@ def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
         result['status_code'] = response.status_code
         response.raise_for_status()
 
-        response_id = response.headers.get('x-response-id')
+        # JSONレスポンスを正しく解析してresponse_idを取得する
+        trigger_response_data = response.json()
+        response_id = trigger_response_data.get('response_id')
+        
         if not response_id:
-            result['error'] = 'Failed to get response ID from trigger'
+            result['error'] = 'Failed to get response_id from trigger response body.'
             result['content'] = response.text
             return result
         
@@ -76,7 +82,7 @@ def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
         result['error'] = 'Scraping job timed out'
         return result
 
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
         result['error'] = str(e)
         if hasattr(e, 'response') and e.response:
              result["status_code"] = e.response.status_code
