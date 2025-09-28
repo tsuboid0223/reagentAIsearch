@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（Collection ID対応・最終確定版）
+（プロキシ接続によるStreamlit Cloud制約回避・最終確定版）
 """
 
 # ==============================================================================
@@ -23,58 +23,38 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # === Bright Data API 連携関数 ===
 # ==============================================================================
 
-def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
+def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Web Scraper IDEを呼び出し、指定URLのHTML取得を依頼する。
-    応答本文からcollection_idを取得する。
+    [最終修正] Streamlit Cloudの制約を回避するため、プロキシ接続に再度変更。
+    認証情報バグを修正した最終版。
     """
-    COLLECTOR_ID = "c_mg3jlmpr1cgbrr3g1t"
-    headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
-    payload = json.dumps([{"url": url}])
+    BRD_HOST = 'brd.superproxy.io'
+    BRD_PORT = 9515
+    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
+    proxies = {'http': proxy_url, 'https': proxy_url}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    }
     result = {"url": url, "status_code": None, "content": None, "error": None}
-
-    try:
-        trigger_endpoint = f'https://api.brightdata.com/dca/trigger?collector={COLLECTOR_ID}&queue_next=1'
-        response = requests.post(trigger_endpoint, headers=headers, data=payload, timeout=40)
-        
-        result['status_code'] = response.status_code
-        response.raise_for_status()
-
-        # [最終修正] 応答本文(JSON)からcollection_idを取得する
-        response_id = response.json().get('collection_id')
-        
-        if not response_id:
-            result['error'] = 'Failed to get collection_id from trigger response body.'
-            result['content'] = response.text
+    
+    for attempt in range(2): # 念のため2回リトライ
+        try:
+            response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=60)
+            result["status_code"] = response.status_code
+            response.raise_for_status()
+            result["content"] = response.text
+            result["error"] = None
             return result
-        
-        for _ in range(20):
-            time.sleep(3)
-            # [最終修正] collection_idを使ってステータスを確認
-            status_response = requests.get(f"https://api.brightdata.com/dca/collections/{response_id}", headers=headers)
-            status_data = status_response.json()
-            if status_data.get('status') == 'done':
-                # [最終修正] collection_idを使って結果を取得
-                result_response = requests.get(f"https://api.brightdata.com/dca/collections/{response_id}/stream", headers=headers)
-                result['status_code'] = result_response.status_code
-                
-                # 結果はNDJSON形式で返ってくるため、最初の行を解析する
-                first_line = result_response.text.splitlines()[0]
-                result_data = json.loads(first_line)
-
-                if result_data and 'body' in result_data:
-                    result['content'] = result_data['body']
-                return result
-        
-        result['error'] = 'Scraping job timed out'
-        return result
-
-    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        result['error'] = str(e)
-        if hasattr(e, 'response') and e.response:
-             result["status_code"] = e.response.status_code
-             result["content"] = e.response.text
-        return result
+        except requests.exceptions.RequestException as e:
+            result["error"] = str(e)
+            if hasattr(e, 'response') and e.response:
+                 result["content"] = e.response.text[:1000] if e.response.text else ""
+            time.sleep(1)
+    
+    return result
 
 
 def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
@@ -110,7 +90,6 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
 # ==============================================================================
 # === AIエージェント関連関数 ===
 # ==============================================================================
-
 def analyze_page_and_extract_info(page_content_result: dict, product_name: str, gemini_api_key: str) -> dict | None:
     """HTMLをGemini APIに渡し、製品情報を抽出する。"""
     html_content = page_content_result.get("content")
@@ -153,7 +132,7 @@ def analyze_page_and_extract_info(page_content_result: dict, product_name: str, 
 # ==============================================================================
 # === 統括エージェント ===
 # ==============================================================================
-def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, preferred_sites: list) -> tuple[list, list]:
+def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, brd_username: str, brd_password: str, preferred_sites: list) -> tuple[list, list]:
     """一連の処理を統括するエージェント。"""
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
@@ -176,7 +155,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     all_page_content_results, found_pages_data = [], []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_url = {executor.submit(get_page_content_with_scraper_ide, url, brightdata_api_key): url for url in unique_urls}
+        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
             my_bar.progress((i + 1) / len(unique_urls), text=f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
@@ -205,10 +184,12 @@ st.sidebar.header("APIキー設定")
 try:
     gemini_api_key = st.secrets["GOOGLE_API_KEY"]
     brightdata_api_key = st.secrets["BRIGHTDATA_API_KEY"]
-    st.sidebar.success("APIキーが設定されています。")
+    brightdata_username = st.secrets["BRIGHTDATA_USERNAME"]
+    brightdata_password = st.secrets["BRIGHTDATA_PASSWORD"]
+    st.sidebar.success("APIキーと認証情報が設定されています。")
 except KeyError:
-    st.sidebar.error("Streamlit Secretsに`GOOGLE_API_KEY`と`BRIGHTDATA_API_KEY`を設定してください。")
-    gemini_api_key, brightdata_api_key = "", ""
+    st.sidebar.error("Streamlit Secretsに必要な情報が設定されていません。")
+    gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password = "", "", "", ""
 
 st.sidebar.header("検索条件")
 product_name_input = st.sidebar.text_input("製品名 (必須)", placeholder="例: Y27632")
@@ -219,8 +200,8 @@ debug_mode_checkbox = st.sidebar.checkbox("デバッグモードを有効にす�
 search_button = st.sidebar.button("検索開始", type="primary")
 
 if search_button:
-    if not all([gemini_api_key, brightdata_api_key]):
-        st.error("APIキーが設定されていません。")
+    if not all([gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password]):
+        st.error("APIキーまたは認証情報が設定されていません。")
     elif not product_name_input:
         st.error("製品名を入力してください。")
     else:
@@ -228,7 +209,7 @@ if search_button:
             product_info = {'ProductName': product_name_input, 'Manufacturer': manufacturer_input}
             preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
             
-            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites)
+            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password, preferred_sites)
             
             final_results = []
             input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
