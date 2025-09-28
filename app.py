@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（正しいAPI呼び出し・最終確定版）
+（正しい接続情報による最終確定版）
 """
 
 # ==============================================================================
@@ -24,52 +24,31 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # === Bright Data API 連携関数 ===
 # ==============================================================================
 
-def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
+def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    [最終修正] 正しいScraping Browser APIエンドポイントを呼び出す。
-    これがScraping Browserゾーンを利用する唯一の正しい方法。
+    [最終修正] 正しいポート(9515)と、ゾーン固有の認証情報(Secrets)を使いプロキシ接続する。
     """
-    headers = {'Authorization': f'Bearer {api_key}'}
-    brightdata_zone_name = 'scraping_browser1'
-    payload = {'url': url, 'zone': brightdata_zone_name, 'country': 'jp'}
+    BRD_HOST = 'brd.superproxy.io'
+    BRD_PORT = 9515  # [修正点] Scraping Browser (Selenium) 用の正しいポートに変更
+    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
+    proxies = {'http': proxy_url, 'https': proxy_url}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    }
     result = {"url": url, "status_code": None, "headers": None, "content": None, "error": None}
-
+    
     try:
-        # [修正点] Bright Data公式ドキュメントに基づく正しいAPIエンドポイント
-        api_endpoint = 'https://api.brightdata.com/scraping/browser'
-        initial_response = requests.post(f'{api_endpoint}/request', headers=headers, json=payload, timeout=40)
-        
-        result['status_code'] = initial_response.status_code
-        initial_response.raise_for_status()
-        
-        response_id = initial_response.headers.get('x-response-id')
-        if not response_id:
-            result['error'] = "Response ID not found in initial request."
-            result['content'] = initial_response.text
-            return result
-
-        result_url = f'{api_endpoint}/response?response_id={response_id}'
-        for _ in range(15):
-            time.sleep(3)
-            result_response = requests.get(result_url, headers=headers, timeout=30)
-            result['status_code'] = result_response.status_code
-            if result_response.status_code == 200:
-                result['content'] = result_response.text
-                return result
-            if result_response.status_code != 202:
-                result['error'] = f"Unexpected status code during polling: {result_response.status_code}"
-                result['content'] = result_response.text
-                return result
-        
-        result['error'] = "Polling timed out after 45 seconds"
-        return result
-
+        response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=60)
+        result["status_code"] = response.status_code
+        result["headers"] = dict(response.headers)
+        response.raise_for_status()
+        result["content"] = response.text
     except requests.exceptions.RequestException as e:
-        result['error'] = str(e)
+        result["error"] = str(e)
         if hasattr(e, 'response') and e.response is not None:
-             result["status_code"] = e.response.status_code
-             result["content"] = e.response.text
-        return result
+             result["content"] = e.response.text[:1000] if e.response.text else ""
+    
+    return result
 
 
 def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
@@ -154,7 +133,7 @@ def analyze_page_and_extract_info(page_content_result: dict, product_name: str, 
 # ==============================================================================
 # === 統括エージェント ===
 # ==============================================================================
-def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, preferred_sites: list) -> tuple[list, list]:
+def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, brd_username: str, brd_password: str, preferred_sites: list) -> tuple[list, list]:
     """一連の処理を統括するエージェント。"""
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
@@ -177,7 +156,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     all_page_content_results, found_pages_data = [], []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brightdata_api_key): url for url in unique_urls}
+        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
             my_bar.progress((i + 1) / len(unique_urls), text=f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
@@ -207,10 +186,12 @@ st.sidebar.header("APIキー設定")
 try:
     gemini_api_key = st.secrets["GOOGLE_API_KEY"]
     brightdata_api_key = st.secrets["BRIGHTDATA_API_KEY"]
-    st.sidebar.success("APIキーが設定されています。")
+    brightdata_username = st.secrets["BRIGHTDATA_USERNAME"]
+    brightdata_password = st.secrets["BRIGHTDATA_PASSWORD"]
+    st.sidebar.success("APIキーと認証情報が設定されています。")
 except KeyError:
-    st.sidebar.error("Streamlit Secretsに`GOOGLE_API_KEY`と`BRIGHTDATA_API_KEY`を設定してください。")
-    gemini_api_key, brightdata_api_key = "", ""
+    st.sidebar.error("Streamlit Secretsに必要な情報が設定されていません。")
+    gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password = "", "", "", ""
 
 st.sidebar.header("検索条件")
 product_name_input = st.sidebar.text_input("製品名 (必須)", placeholder="例: Y27632")
@@ -222,8 +203,8 @@ search_button = st.sidebar.button("検索開始", type="primary")
 
 # --- メインコンテンツ ---
 if search_button:
-    if not all([gemini_api_key, brightdata_api_key]):
-        st.error("APIキーが設定されていません。")
+    if not all([gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password]):
+        st.error("APIキーまたは認証情報が設定されていません。")
     elif not product_name_input:
         st.error("製品名を入力してください。")
     else:
@@ -231,7 +212,7 @@ if search_button:
             product_info = {'ProductName': product_name_input, 'Manufacturer': manufacturer_input}
             preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
             
-            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites)
+            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password, preferred_sites)
             
             final_results = []
             input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
