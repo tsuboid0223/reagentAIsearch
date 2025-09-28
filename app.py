@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（正しい接続情報による最終確定版）
+（スーパーヘッダー + リトライ実装による最終打開策版）
 """
 
 # ==============================================================================
@@ -17,7 +17,6 @@ import json
 import concurrent.futures
 import urllib3
 
-# urllib3のSSL証明書警告を非表示にする
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
@@ -26,44 +25,64 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    [最終修正] 正しいポート(9515)と、ゾーン固有の認証情報(Secrets)を使いプロキシ接続する。
+    [最終修正] スーパーヘッダーとリトライ処理を実装し、高度なボット対策の突破を試みる。
     """
     BRD_HOST = 'brd.superproxy.io'
-    BRD_PORT = 9515  # [修正点] Scraping Browser (Selenium) 用の正しいポートに変更
+    BRD_PORT = 9515
     proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    }
-    result = {"url": url, "status_code": None, "headers": None, "content": None, "error": None}
     
-    try:
-        response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=60)
-        result["status_code"] = response.status_code
-        result["headers"] = dict(response.headers)
-        response.raise_for_status()
-        result["content"] = response.text
-    except requests.exceptions.RequestException as e:
-        result["error"] = str(e)
-        if hasattr(e, 'response') and e.response is not None:
-             result["content"] = e.response.text[:1000] if e.response.text else ""
+    # [新機能] 本物のブラウザを模倣した「スーパーヘッダー」
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+        'Sec-Ch-Ua': '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    }
+    
+    result = {"url": url, "status_code": None, "content": None, "error": None}
+    
+    # [新機能] 堅牢なリトライ処理 (最大3回試行)
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=60)
+            result["status_code"] = response.status_code
+            response.raise_for_status()
+            result["content"] = response.text
+            result["error"] = None # 成功したのでエラーをクリア
+            return result # 成功したらループを抜ける
+        except requests.exceptions.RequestException as e:
+            result["error"] = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                 result["content"] = e.response.text[:1000] if e.response.text else ""
+            
+            # 最後の試行でなければ、少し待ってリトライ
+            if attempt < 2:
+                time.sleep(2) 
     
     return result
 
 
 def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
     """Bright DataのSERP APIでGoogle検索を実行し、URLリストを取得する。"""
+    # (この部分は変更なし)
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
     google_search_url = f"https://www.google.co.jp/search?q={urllib.parse.quote(query)}&hl=ja&gl=jp&ceid=JP:ja"
     payload = {'zone': 'serp_api1', 'url': google_search_url}
-
     try:
         initial_response = requests.post('https://api.brightdata.com/serp/req', headers=headers, json=payload, timeout=30)
         initial_response.raise_for_status()
         response_id = initial_response.headers.get('x-response-id')
         if not response_id: return []
-        
         result_url = f'https://api.brightdata.com/serp/get_result?response_id={response_id}'
         for _ in range(15):
             time.sleep(2)
@@ -81,6 +100,8 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
         return []
     except requests.exceptions.RequestException: return []
 
+
+# (以降のAIエージェント関連関数、統括エージェント、Streamlit UI部分は変更ありません)
 # ==============================================================================
 # === AIエージェント関連関数 ===
 # ==============================================================================
