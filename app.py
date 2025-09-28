@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-（プロキシ接続バグ修正・最終確定版）
+（認証情報バグ修正・最終確定版）
 """
 
 # ==============================================================================
@@ -24,19 +24,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # === Bright Data API 連携関数 ===
 # ==============================================================================
 
-def get_page_content_with_brightdata(url: str, api_key: str) -> dict:
+def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Bright Dataのプロキシ経由でHTMLを取得する。
-    api_keyをプロキシのパスワードとして使用する。
+    [最終修正] Secretsから渡された正しいユーザー名とパスワードでプロキシ接続を実行する。
     """
     BRD_HOST = 'brd.superproxy.io'
     BRD_PORT = 22225
-    BRD_USERNAME = 'brd-customer-hl_3c49a4bb-zone-scraping_browser1'
-    BRD_PASSWORD = api_key  # 受け取ったAPIキーをパスワードとして使用
-
-    proxy_url = f'http://{BRD_USERNAME}:{BRD_PASSWORD}@{BRD_HOST}:{BRD_PORT}'
+    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
-    headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36' }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    }
     result = {"url": url, "status_code": None, "headers": None, "content": None, "error": None}
     
     try:
@@ -135,7 +133,7 @@ def analyze_page_and_extract_info(page_content_result: dict, product_name: str, 
 # ==============================================================================
 # === 統括エージェント ===
 # ==============================================================================
-def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, preferred_sites: list) -> tuple[list, list]:
+def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_key: str, brd_username: str, brd_password: str, preferred_sites: list) -> tuple[list, list]:
     """一連の処理を統括するエージェント。"""
     product_name = product_info['ProductName']
     manufacturer = product_info.get('Manufacturer', '')
@@ -158,8 +156,8 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     all_page_content_results, found_pages_data = [], []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        # [バグ修正] get_page_content_with_brightdata に brightdata_api_key を正しく渡す
-        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brightdata_api_key): url for url in unique_urls}
+        # [バグ修正] get_page_content_with_brightdata に正しいユーザー名とパスワードを渡す
+        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
             my_bar.progress((i + 1) / len(unique_urls), text=f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
@@ -189,10 +187,12 @@ st.sidebar.header("APIキー設定")
 try:
     gemini_api_key = st.secrets["GOOGLE_API_KEY"]
     brightdata_api_key = st.secrets["BRIGHTDATA_API_KEY"]
-    st.sidebar.success("APIキーが設定されています。")
+    brightdata_username = st.secrets["BRIGHTDATA_USERNAME"]
+    brightdata_password = st.secrets["BRIGHTDATA_PASSWORD"]
+    st.sidebar.success("APIキーと認証情報が設定されています。")
 except KeyError:
-    st.sidebar.error("Streamlit Secretsに`GOOGLE_API_KEY`と`BRIGHTDATA_API_KEY`を設定してください。")
-    gemini_api_key, brightdata_api_key = "", ""
+    st.sidebar.error("Streamlit Secretsに必要な情報が設定されていません。")
+    gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password = "", "", "", ""
 
 st.sidebar.header("検索条件")
 product_name_input = st.sidebar.text_input("製品名 (必須)", placeholder="例: Y27632")
@@ -204,8 +204,8 @@ search_button = st.sidebar.button("検索開始", type="primary")
 
 # --- メインコンテンツ ---
 if search_button:
-    if not all([gemini_api_key, brightdata_api_key]):
-        st.error("APIキーが設定されていません。")
+    if not all([gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password]):
+        st.error("APIキーまたは認証情報が設定されていません。")
     elif not product_name_input:
         st.error("製品名を入力してください。")
     else:
@@ -213,7 +213,8 @@ if search_button:
             product_info = {'ProductName': product_name_input, 'Manufacturer': manufacturer_input}
             preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
             
-            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, preferred_sites)
+            # [バグ修正] orchestrator_agent に正しいユーザー名とパスワードを渡す
+            pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password, preferred_sites)
             
             final_results = []
             input_date = pd.Timestamp.now().strftime('%Y-%m-%d')
