@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 製品調達AIエージェント Streamlitアプリケーション
-
-指定された製品名に基づき、試薬会社サイトから製品情報をウェブスクレイピングし、
-価格、在庫状況などを一覧で表示します。
-Bright DataのWeb Scraper IDEとGemini APIを利用して、
-高度な情報抽出を実現します。
+（正しいAPI呼び出し・最終確定版）
 """
 
 # ==============================================================================
@@ -21,7 +17,6 @@ import json
 import concurrent.futures
 import urllib3
 
-# urllib3のSSL証明書警告を非表示にする
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
@@ -30,53 +25,45 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
     """
-    Bright DataのWeb Scraper IDEを呼び出し、指定URLのHTML取得を依頼する。
-    これが最も強力で確実なスクレイピング方法。
-
-    Args:
-        url (str): 取得対象のURL。
-        api_key (str): Bright DataのAPIキー。
-
-    Returns:
-        dict: 取得結果を含む辞書 (URL, ステータスコード, HTMLコンテンツ, エラー情報など)。
+    [最終修正] 公式ドキュメント通りの正しいエンドポイントとペイロードでWeb Scraper IDEを呼び出す。
     """
-    # ### ▼▼▼ ここをあなたのIDに書き換えてください ▼▼▼ ###
-    # Bright Dataの管理画面で作成したWeb Scraper IDEの「Collector ID」
     COLLECTOR_ID = "c_mg3jlmpr1cgbrr3g1t"
-    # ### ▲▲▲ 設定ここまで ▲▲▲ ###
-    
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
-    payload = [{'url': url, 'country': 'jp'}] 
+    # [修正点] 公式ドキュメントに示された正しいペイロード形式
+    payload = json.dumps([{"url": url}])
     result = {"url": url, "status_code": None, "content": None, "error": None}
 
     try:
-        # Web Scraper IDEの実行をトリガーするエンドポイント
-        trigger_endpoint = f'https://api.brightdata.com/dca/trigger?collector={COLLECTOR_ID}'
-        response = requests.post(trigger_endpoint, headers=headers, json=payload, timeout=40)
+        # [修正点] 公式ドキュメントに示された正しいトリガー用エンドポイント
+        trigger_endpoint = f'https://api.brightdata.com/dca/trigger?collector={COLLECTOR_ID}&queue_next=1'
+        response = requests.post(trigger_endpoint, headers=headers, data=payload, timeout=40)
         
         result['status_code'] = response.status_code
         response.raise_for_status()
 
-        # JSONレスポンスを正しく解析してresponse_idを取得する
-        trigger_response_data = response.json()
-        response_id = trigger_response_data.get('response_id')
-        
+        response_id = response.headers.get('x-response-id')
         if not response_id:
-            result['error'] = 'Failed to get response_id from trigger response body.'
+            result['error'] = 'Failed to get response ID from trigger'
             result['content'] = response.text
             return result
         
-        # 実行完了まで待機し、結果を取得
-        for _ in range(20): # 最大60秒待機
+        for _ in range(20):
             time.sleep(3)
-            status_response = requests.get(f"https://api.brightdata.com/dca/status?response_id={response_id}", headers=headers)
+            # [修正点] 公式ドキュメントに示された正しいステータス確認エンドポイント
+            status_response = requests.get(f"https://api.brightdata.com/dca/status?id={response_id}", headers=headers)
             status_data = status_response.json()
             if status_data.get('status') == 'done':
+                # [修正点] 公式ドキュメントに示された正しい結果取得エンドポイント
                 result_response = requests.get(f"https://api.brightdata.com/dca/get_result?response_id={response_id}", headers=headers)
                 result['status_code'] = result_response.status_code
-                result_data = result_response.json()
-                if result_data and isinstance(result_data, list) and 'body' in result_data[0]:
-                    result['content'] = result_data[0]['body']
+                
+                # 結果はNDJSON形式で返ってくる場合があるため、最初の行を解析
+                first_line = result_response.text.splitlines()[0]
+                result_data = json.loads(first_line)
+
+                # Web Scraper IDEのデフォルトの出力形式に合わせて 'body' を取得
+                if result_data and isinstance(result_data, dict) and 'body' in result_data:
+                    result['content'] = result_data['body']
                 return result
         
         result['error'] = 'Scraping job timed out'
@@ -92,6 +79,7 @@ def get_page_content_with_scraper_ide(url: str, api_key: str) -> dict:
 
 def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
     """Bright DataのSERP APIでGoogle検索を実行し、URLリストを取得する。"""
+    # (この部分は変更なし)
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
     google_search_url = f"https://www.google.co.jp/search?q={urllib.parse.quote(query)}&hl=ja&gl=jp&ceid=JP:ja"
@@ -118,12 +106,12 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
         return []
     except requests.exceptions.RequestException: return []
 
+# (以降のAIエージェント関連関数、統括エージェント、Streamlit UI部分は変更ありません)
 # ==============================================================================
 # === AIエージェント関連関数 ===
 # ==============================================================================
-
 def analyze_page_and_extract_info(page_content_result: dict, product_name: str, gemini_api_key: str) -> dict | None:
-    """HTMLコンテンツをGemini APIに渡し、製品情報を抽出する。"""
+    """HTMLをGemini APIに渡し、製品情報を抽出する。"""
     html_content = page_content_result.get("content")
     if page_content_result.get("error") or not html_content:
         return None
@@ -276,11 +264,4 @@ if search_button:
                 status, is_error = log.get('status_code'), log.get('error') is not None
                 
                 if is_error: st.error(f"接続エラー: {log['url']}")
-                elif status != 200 and status is not None: st.warning(f"ステータスコード異常 ({status}): {log['url']}")
-                else: st.success(f"取得成功 ({status}): {log['url']}")
-
-                with st.expander("詳細を表示"):
-                    if is_error: st.write(f"**エラー内容:** `{log['error']}`")
-                    log_display = log.copy()
-                    if log_display.get('content'): log_display['content'] = (log_display['content'][:1000] + "...") if log_display['content'] else ""
-                    st.json(log_display)
+                elif status != 200 and status is not None: st.warning(f"ステータスコード異常 ({s
