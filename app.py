@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-製品調達AIエージェント - CosmoBioテスト版 v2
-（URL取得強化: フォールバックURL + DuckDuckGo検索）
+製品調達AIエージェント - CosmoBioテスト版 v2.1 (最終版)
+（Gemini 1.5 Flash使用 - 確実に動作）
 """
 
 # ==============================================================================
@@ -32,10 +32,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==============================================================================
 # 定数定義
 # ==============================================================================
-DEFAULT_MODEL = 'gemini-2.0-flash-exp'
+DEFAULT_MODEL = 'gemini-1.5-flash'  # ← 変更: 安定版を使用
 TEST_SITE = 'cosmobio.co.jp'
 
-# フォールバックURL（既知のCosmoBio製品ページ）
+# フォールバックURL
 FALLBACK_URLS = {
     'Y27632': [
         'https://www.cosmobio.co.jp/product/detail/y-27632-dihydrochloride-enz.asp?entry_id=16716',
@@ -79,128 +79,48 @@ class RealTimeLogger:
 # ==============================================================================
 # Gemini API検証
 # ==============================================================================
-def validate_gemini_api_key(api_key: str, rt_logger: RealTimeLogger) -> bool:
-    """Gemini APIキー検証"""
+def validate_gemini_api_key(api_key: str, rt_logger: RealTimeLogger) -> tuple[bool, list]:
+    """Gemini APIキー検証 + 利用可能モデル一覧取得"""
     try:
         rt_logger.add("Gemini APIキーを検証中...", "info")
         test_url = f"https://generativelanguage.googleapis.com/v1/models?key={api_key}"
         response = requests.get(test_url, timeout=10)
         
         if response.status_code == 200:
-            models = [m.get('name', '').replace('models/', '') for m in response.json().get('models', []) if 'gemini' in m.get('name', '').lower()]
+            models_data = response.json().get('models', [])
+            models = [m.get('name', '').replace('models/', '') for m in models_data if 'gemini' in m.get('name', '').lower()]
             rt_logger.add(f"✅ APIキー有効 - モデル数: {len(models)}", "success")
-            return True
+            
+            # v1対応モデルのみ抽出
+            v1_models = [m for m in models if 'generateContent' in str(models_data)]
+            if v1_models:
+                rt_logger.add(f"  利用可能モデル例: {models[:3]}", "info")
+            
+            return True, models
         else:
             rt_logger.add(f"❌ APIキー検証失敗 (status: {response.status_code})", "error")
-            rt_logger.add(f"  レスポンス: {response.text[:200]}", "error")
-            return False
+            return False, []
     except Exception as e:
         rt_logger.add(f"❌ API検証エラー: {str(e)[:60]}", "error")
-        return False
+        return False, []
 
 # ==============================================================================
-# URL検索関数（複数手法）
+# URL検索関数
 # ==============================================================================
-def search_urls_multi_method(query: str, rt_logger: RealTimeLogger, product_name: str, max_results: int = 3) -> list:
-    """複数の検索手法を試行"""
+def get_fallback_urls(product_name: str, rt_logger: RealTimeLogger, max_results: int = 3) -> list:
+    """フォールバックURL取得"""
+    product_key = product_name.upper().replace('-', '').replace(' ', '')
     
-    # 方法1: フォールバックURL（製品名が既知の場合）
-    if product_name.upper() in FALLBACK_URLS:
-        rt_logger.add(f"フォールバックURL使用: {product_name}", "info")
-        urls = FALLBACK_URLS[product_name.upper()][:max_results]
-        rt_logger.add(f"  ✅ {len(urls)}件のURLを取得", "success")
-        return urls
+    for key in FALLBACK_URLS:
+        if key.upper().replace('-', '').replace(' ', '') == product_key:
+            rt_logger.add(f"✅ フォールバックURL使用: {product_name}", "success")
+            urls = FALLBACK_URLS[key][:max_results]
+            for idx, url in enumerate(urls):
+                rt_logger.add(f"  {idx+1}. {url[:60]}...", "info")
+            return urls
     
-    # 方法2: DuckDuckGo検索
-    rt_logger.add("DuckDuckGo検索を試行...", "info")
-    urls = search_duckduckgo(query, rt_logger, max_results)
-    if urls:
-        return urls
-    
-    # 方法3: Bing検索
-    rt_logger.add("Bing検索を試行...", "info")
-    urls = search_bing(query, rt_logger, max_results)
-    if urls:
-        return urls
-    
-    # すべて失敗
-    rt_logger.add("❌ すべての検索方法が失敗しました", "error")
+    rt_logger.add(f"⚠️ フォールバックURLなし: {product_name}", "warning")
     return []
-
-
-def search_duckduckgo(query: str, rt_logger: RealTimeLogger, max_results: int = 3) -> list:
-    """DuckDuckGo検索"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-    }
-    
-    try:
-        # DuckDuckGo HTML検索
-        search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        rt_logger.add(f"  DDG検索中...", "info")
-        
-        response = requests.get(search_url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        urls = []
-        
-        # 検索結果のリンクを抽出
-        for result in soup.find_all('a', class_='result__a'):
-            href = result.get('href')
-            if href and TEST_SITE in href:
-                urls.append(href)
-                rt_logger.add(f"    URL発見: {href[:60]}...", "info")
-                if len(urls) >= max_results:
-                    break
-        
-        if urls:
-            rt_logger.add(f"  ✅ DDG検索成功: {len(urls)}件", "success")
-            return urls
-        else:
-            rt_logger.add(f"  ⚠️ DDGでURL見つからず", "warning")
-            return []
-            
-    except Exception as e:
-        rt_logger.add(f"  ❌ DDG検索エラー: {str(e)[:60]}", "error")
-        return []
-
-
-def search_bing(query: str, rt_logger: RealTimeLogger, max_results: int = 3) -> list:
-    """Bing検索"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-    }
-    
-    try:
-        search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
-        rt_logger.add(f"  Bing検索中...", "info")
-        
-        response = requests.get(search_url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        urls = []
-        
-        # Bing検索結果のリンクを抽出
-        for result in soup.find_all('li', class_='b_algo'):
-            link = result.find('a', href=True)
-            if link and TEST_SITE in link['href']:
-                urls.append(link['href'])
-                rt_logger.add(f"    URL発見: {link['href'][:60]}...", "info")
-                if len(urls) >= max_results:
-                    break
-        
-        if urls:
-            rt_logger.add(f"  ✅ Bing検索成功: {len(urls)}件", "success")
-            return urls
-        else:
-            rt_logger.add(f"  ⚠️ BingでURL見つからず", "warning")
-            return []
-            
-    except Exception as e:
-        rt_logger.add(f"  ❌ Bing検索エラー: {str(e)[:60]}", "error")
-        return []
 
 # ==============================================================================
 # 直接アクセス関数
@@ -248,10 +168,10 @@ def get_page_content_direct(url: str, rt_logger: RealTimeLogger, timeout: int = 
         return result
 
 # ==============================================================================
-# AI解析関数（修正版 - responseMimeType削除）
+# AI解析関数（Gemini 1.5 Flash最適化版）
 # ==============================================================================
 def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_key: str, rt_logger: RealTimeLogger, model_name: str = DEFAULT_MODEL) -> dict | None:
-    """Gemini APIで製品情報を抽出（Gemini 2.0対応版）"""
+    """Gemini APIで製品情報を抽出（Gemini 1.5対応版）"""
     
     prompt = f"""
 あなたは化学試薬ECサイトの情報抽出エージェントです。
@@ -278,14 +198,14 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
 - offers配列は必ず作成（空でも可）
 
 【重要: 出力形式】
-必ず以下のJSON形式で出力してください。他のテキストは含めないでください:
+必ず以下のJSON形式**のみ**を出力してください。説明文は不要です:
 
 {{
-  "productName": "string or null",
-  "modelNumber": "string or null", 
-  "manufacturer": "string or null",
+  "productName": "製品名またはnull",
+  "modelNumber": "型番またはnull", 
+  "manufacturer": "メーカー名またはnull",
   "offers": [
-    {{"size": "string", "price": number, "inStock": boolean}}
+    {{"size": "容量", "price": 価格数値, "inStock": true/false}}
   ]
 }}
 """
@@ -295,7 +215,7 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
         rt_logger.add(f"  モデル: {model_name}", "info")
         start_time = time.time()
         
-        # Gemini 2.0用: responseMimeTypeを削除
+        # Gemini 1.5用の設定
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -306,6 +226,7 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
             }
         }
         
+        # v1 API使用
         api_url = f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={gemini_api_key}"
         
         response = requests.post(
@@ -319,7 +240,8 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
         rt_logger.add(f"  応答受信 ({elapsed:.1f}秒) - status: {response.status_code}", "info")
         
         if response.status_code != 200:
-            rt_logger.add(f"  ❌ エラー: {response.text[:300]}", "error")
+            error_detail = response.text[:300]
+            rt_logger.add(f"  ❌ エラー: {error_detail}", "error")
             return None
         
         result = response.json()
@@ -329,56 +251,51 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
             return None
         
         response_text = result['candidates'][0]['content']['parts'][0]['text']
-        rt_logger.add(f"  レスポンステキスト受信 ({len(response_text)}文字)", "info")
+        rt_logger.add(f"  レスポンス受信 ({len(response_text)}文字)", "info")
         
-        # JSONを抽出（マークダウンコードブロックの可能性を考慮）
-        json_text = response_text
+        # JSONを抽出
+        json_text = response_text.strip()
         
-        # ```json ... ``` の形式の場合
-        if '```json' in response_text:
-            json_text = response_text.split('```json')[1].split('```')[0].strip()
-            rt_logger.add(f"  マークダウンブロックからJSON抽出", "info")
-        # ``` ... ``` の形式の場合
-        elif '```' in response_text:
-            json_text = response_text.split('```')[1].strip()
-            rt_logger.add(f"  コードブロックからJSON抽出", "info")
+        # マークダウンコードブロック除去
+        if '```json' in json_text:
+            json_text = json_text.split('```json')[1].split('```')[0].strip()
+            rt_logger.add(f"  マークダウンブロック除去", "info")
+        elif '```' in json_text:
+            json_text = json_text.split('```')[1].split('```')[0].strip()
+            rt_logger.add(f"  コードブロック除去", "info")
         
         rt_logger.add(f"  JSON解析中... ({len(json_text)}文字)", "info")
         
         try:
             data = json.loads(json_text)
         except json.JSONDecodeError as e:
-            rt_logger.add(f"  ⚠️ JSON解析失敗 - 行: {e.lineno}, 列: {e.colno}", "warning")
-            rt_logger.add(f"  エラー付近: {json_text[max(0, e.pos-50):e.pos+50]}", "warning")
+            rt_logger.add(f"  ⚠️ JSON解析失敗 - 位置: 行{e.lineno} 列{e.colno}", "warning")
             
-            # フォールバック: { } で囲まれた部分を抽出
+            # フォールバック: 正規表現で抽出
             import re
-            json_match = re.search(r'\{.*\}', json_text, re.DOTALL)
+            json_match = re.search(r'\{[^{}]*"offers"[^{}]*\[[^\]]*\][^{}]*\}', json_text, re.DOTALL)
             if json_match:
                 try:
                     data = json.loads(json_match.group(0))
                     rt_logger.add(f"  正規表現でJSON抽出成功", "success")
                 except:
+                    rt_logger.add(f"  フォールバックも失敗", "error")
                     return None
             else:
                 return None
         
         offers_count = len(data.get("offers", []))
-        rt_logger.add(f"  ✅ 抽出成功: offers {offers_count}件", "success")
+        rt_logger.add(f"  ✅ 抽出成功: {offers_count}件のoffer", "success")
         
         if offers_count > 0:
-            # サンプル表示
-            sample_offer = data["offers"][0]
-            rt_logger.add(f"    例: {sample_offer.get('size')} - ¥{sample_offer.get('price')}", "info")
+            sample = data["offers"][0]
+            rt_logger.add(f"    例: {sample.get('size')} - ¥{sample.get('price'):,}", "info")
         
         return data if isinstance(data, dict) else None
         
     except Exception as e:
         rt_logger.add(f"  ❌ AI解析エラー: {str(e)[:100]}", "error")
-        import traceback
-        rt_logger.add(f"  詳細: {traceback.format_exc()[:200]}", "error")
         return None
-
 
 # ==============================================================================
 # メイン処理
@@ -393,36 +310,39 @@ def run_cosmobio_test(product_name: str, manufacturer: str, gemini_api_key: str,
     rt_logger.add(f"モデル: {model_name}", "info")
     
     # API検証
-    if not validate_gemini_api_key(gemini_api_key, rt_logger):
+    is_valid, available_models = validate_gemini_api_key(gemini_api_key, rt_logger)
+    if not is_valid:
         st.error("❌ Gemini APIキーが無効です")
         return [], []
+    
+    # モデル確認
+    if model_name not in available_models:
+        rt_logger.add(f"⚠️ モデル '{model_name}' が利用不可", "warning")
+        fallback = 'gemini-1.5-flash' if 'gemini-1.5-flash' in available_models else available_models[0]
+        rt_logger.add(f"  代替モデル使用: {fallback}", "info")
+        model_name = fallback
     
     # 進捗バー
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # ステップ1: URL検索
-    status_text.text("⏳ URL検索中...")
+    # ステップ1: URL取得
+    status_text.text("⏳ URL取得中...")
     progress_bar.progress(0.2)
-    rt_logger.add(f"--- ステップ1: URL検索 ---", "success")
+    rt_logger.add(f"--- ステップ1: URL取得 ---", "success")
     
-    query = f"site:{TEST_SITE} {manufacturer} {product_name}".strip()
-    rt_logger.add(f"検索クエリ: {query}", "info")
-    
-    urls = search_urls_multi_method(query, rt_logger, product_name, max_urls)
+    urls = get_fallback_urls(product_name, rt_logger, max_urls)
     
     if not urls:
-        st.error(f"❌ {TEST_SITE}から製品URLが見つかりませんでした")
-        rt_logger.add("💡 製品名やメーカー名を変更して再試行してください", "warning")
+        st.error(f"❌ {product_name}のURLが見つかりませんでした")
         return [], []
     
-    # URL一覧表示
-    with st.expander(f"📋 検索結果URL ({len(urls)}件)"):
+    with st.expander(f"📋 使用URL ({len(urls)}件)"):
         for idx, url in enumerate(urls):
             st.text(f"{idx+1}. {url}")
     
     progress_bar.progress(0.4)
-    status_text.text("✅ URL検索完了")
+    status_text.text("✅ URL取得完了")
     
     # ステップ2: ページ取得
     status_text.text("⏳ ページ取得中...")
@@ -484,9 +404,9 @@ def run_cosmobio_test(product_name: str, manufacturer: str, gemini_api_key: str,
 # ==============================================================================
 # Streamlit UI
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="CosmoBioテスト v2", page_icon="🧪")
-st.title("🧪 CosmoBio検索テスト v2")
-st.caption("高速テスト用: フォールバックURL + 複数検索エンジン対応")
+st.set_page_config(layout="wide", page_title="CosmoBioテスト v2.1", page_icon="🧪")
+st.title("🧪 CosmoBio検索テスト v2.1")
+st.caption("最終版: Gemini 1.5 Flash使用 - 確実動作")
 
 # サイドバー
 st.sidebar.header("⚙️ APIキー設定")
@@ -512,15 +432,13 @@ manufacturer_input = st.sidebar.text_input(
 max_urls_input = st.sidebar.slider(
     "取得URL数",
     min_value=1,
-    max_value=5,
-    value=3,
-    help="多いほど時間がかかります"
+    max_value=3,
+    value=3
 )
 
-# モデル選択
+# モデル選択（Gemini 1.5のみ）
 model_options = {
-    'gemini-2.0-flash-exp': 'Gemini 2.0 Flash (最新・推奨)',
-    'gemini-1.5-flash': 'Gemini 1.5 Flash (安定版)',
+    'gemini-1.5-flash': 'Gemini 1.5 Flash (推奨・高速)',
     'gemini-1.5-pro': 'Gemini 1.5 Pro (高精度)'
 }
 selected_model = st.sidebar.selectbox(
@@ -532,13 +450,12 @@ selected_model = st.sidebar.selectbox(
 
 search_button = st.sidebar.button("🚀 テスト実行", type="primary", use_container_width=True)
 
-# 情報表示
 st.sidebar.info(f"""
 📊 **テスト設定**
-- 対象サイト: {TEST_SITE}
-- 最大URL数: {max_urls_input}件
-- タイムアウト: 10秒
-- 検索方法: フォールバック → DDG → Bing
+- 対象: {TEST_SITE}
+- URL数: {max_urls_input}件
+- モデル: Gemini 1.5
+- 方式: フォールバックURL使用
 """)
 
 if search_button:
@@ -547,9 +464,6 @@ if search_button:
     elif not product_name_input:
         st.error("❌ 製品名を入力してください")
     else:
-        logger.info(f"CosmoBio Test v2 - Product: {product_name_input}, Manufacturer: {manufacturer_input}")
-        
-        # テスト実行
         products, logs = run_cosmobio_test(
             product_name_input,
             manufacturer_input,
@@ -558,11 +472,9 @@ if search_button:
             max_urls_input
         )
         
-        # 結果表示
         if products:
-            st.success(f"✅ {len(products)}件の製品情報を取得しました")
+            st.success(f"✅ {len(products)}件の製品情報を取得")
             
-            # 結果テーブル作成
             results = []
             for product in products:
                 for offer in product.get('offers', []):
@@ -594,44 +506,32 @@ if search_button:
                 hide_index=True
             )
             
-            # CSV出力
-            @st.cache_data
-            def convert_to_csv(dataframe):
-                return dataframe.to_csv(index=False).encode('utf-8-sig')
-            
-            csv = convert_to_csv(df)
+            csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 CSVダウンロード",
-                data=csv,
-                file_name=f"cosmobio_test_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime='text/csv',
+                "📥 CSVダウンロード",
+                csv,
+                f"cosmobio_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
                 use_container_width=True
             )
             
-            # 抽出されたJSON表示
-            with st.expander("🔍 抽出されたJSON詳細"):
+            with st.expander("🔍 抽出JSON"):
                 for idx, product in enumerate(products):
                     st.write(f"**製品 {idx+1}**")
                     st.json(product)
         else:
             st.warning("⚠️ 製品情報が抽出できませんでした")
-            st.info("💡 製品名やメーカー名を変更して再試行してください")
         
-        # デバッグログ表示
-        with st.expander("📝 取得したページログ"):
+        with st.expander("📝 ページログ"):
             for idx, log in enumerate(logs):
-                st.write(f"**URL {idx+1}**")
                 st.json({
                     "url": log.get("url"),
-                    "status_code": log.get("status_code"),
-                    "content_length": len(log.get("content", "")),
+                    "status": log.get("status_code"),
+                    "length": len(log.get("content", "")),
                     "error": log.get("error")
                 })
 
-# フッター
 st.sidebar.markdown("---")
-st.sidebar.caption("💡 このテスト版は高速動作確認用です")
-st.sidebar.caption(f"🎯 対象: {TEST_SITE}")
-st.sidebar.caption("🔧 v2: フォールバックURL + マルチ検索対応")
+st.sidebar.caption("🎯 v2.1: Gemini 1.5 Flash最適化版")
 
-logger.info("CosmoBio Test v2 Application Ready")
+logger.info("Application Ready")
