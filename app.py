@@ -26,12 +26,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Scraping Browserで生bodyテキスト抽出（文字化け対応）。
+    Scraping Browserで生bodyテキスト抽出（認証/ポート修正）。
     """
     BRD_HOST = 'brd.superproxy.io'
-    BRD_PORT = 22225  # HTTP Browserポート
-    session_id = f'session_{int(time.time())}'
-    proxy_url = f'http://{brd_username}-{session_id}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
+    BRD_PORT = 24000  # HTTP Browserポート (ドキュメント対応)
+    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'  # シンプル認証
     proxies = {'http': proxy_url, 'https': proxy_url}
     headers = {
         'Content-Type': 'application/json',
@@ -39,29 +38,22 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     }
     result = {"url": url, "status_code": None, "content": None, "error": None}
     
-    # extractorsでbodyテキスト抽出
+    # 簡略payloadでbodyテキスト取得
     payload = {
         'url': url,
         'renderJS': True,
-        'waitFor': 5000,
-        'extractors': {
-            'body': {
-                'selector': 'body',
-                'outputType': 'text'
-            }
-        }
+        'waitFor': 5000
     }
     
-    for attempt in range(2):
+    for attempt in range(3):  # リトライ強化
         try:
             response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=90)
             result["status_code"] = response.status_code
             response.raise_for_status()
+            # レスポンスからbodyテキスト抽出
             data = response.json()
-            # bodyテキスト取得
-            result["content"] = data.get('extractors', {}).get('body', {}).get('text', '') or data.get('content', '')
-            # ノイズ除去（script/style除去相当）
-            soup = BeautifulSoup(result["content"], 'html.parser')
+            html = data.get('content', response.text)
+            soup = BeautifulSoup(html, 'html.parser')
             for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
                 tag.decompose()
             result["content"] = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
@@ -70,7 +62,9 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
             return result
         except Exception as e:
             result["error"] = str(e)
-            time.sleep(random.uniform(3, 6))
+            if '407' in str(e) or 'Invalid Auth' in str(e):
+                st.warning(f"認証エラー再試行: {url}")
+            time.sleep(random.uniform(5, 10))  # 遅延強化
     return result
 
 
