@@ -26,45 +26,42 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Scraping Browserで生bodyテキスト抽出（認証/ポート修正）。
+    Scraping Browserで生bodyテキスト抽出（ハング/timeout調整）。
     """
     BRD_HOST = 'brd.superproxy.io'
-    BRD_PORT = 24000  # HTTP Browserポート (ドキュメント対応)
-    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'  # シンプル認証
+    BRD_PORT = 24000  # HTTP Browserポート
+    proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
     headers = {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
     }
     result = {"url": url, "status_code": None, "content": None, "error": None}
     
-    # 簡略payloadでbodyテキスト取得
     payload = {
         'url': url,
         'renderJS': True,
-        'waitFor': 5000
+        'waitFor': 5000,
+        'headers': headers  # UA偽装追加
     }
     
-    for attempt in range(3):  # リトライ強化
+    for attempt in range(3):
         try:
-            response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=90)
+            response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=120)  # 延長
             result["status_code"] = response.status_code
             response.raise_for_status()
-            # レスポンスからbodyテキスト抽出
             data = response.json()
             html = data.get('content', response.text)
             soup = BeautifulSoup(html, 'html.parser')
             for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
                 tag.decompose()
             result["content"] = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
-            result["content"] = result["content"][:18000]  # Gemini限界
+            result["content"] = result["content"][:18000]
             result["error"] = None
             return result
         except Exception as e:
             result["error"] = str(e)
-            if '407' in str(e) or 'Invalid Auth' in str(e):
-                st.warning(f"認証エラー再試行: {url}")
-            time.sleep(random.uniform(5, 10))  # 遅延強化
+            time.sleep(random.uniform(5, 10))
     return result
 
 
@@ -177,7 +174,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     my_bar = st.progress(0, text="Webページを取得中...")
     all_page_content_results, found_pages_data = [], []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) -> tuple[list, list]:
         future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
@@ -258,7 +255,7 @@ if search_button:
             
             if not final_results:
                 st.warning("検索結果から有効な製品情報が見つかりませんでした。")
-                search_term = f"{product_info.get('Manufacturer', '')} {product_info['ProductName']}"
+                search_term = f"{product_info.get('manufacturer', '')} {product_info['ProductName']}"
                 query_url = f"https://www.google.com/search?q={urllib.parse.quote(search_term)}"
                 final_results.append({ '入力日': input_date, '製品名': product_info['ProductName'], '型番/製品番号': 'N/A', '仕様': 'N/A', 'メーカー': product_info.get('Manufacturer', ''), 'リスト単価': 0, '在庫': 'なし/不明', '情報元URL': query_url })
             
