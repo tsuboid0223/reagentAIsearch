@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-製品調達AIエージェント Streamlitアプリケーション
+コスモバイオ限定テスト版製品調達AIエージェント Streamlitアプリケーション
 （プロキシ接続によるStreamlit Cloud制約回避・最終確定版）
 """
 
@@ -14,7 +14,6 @@ import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 import json
-import concurrent.futures
 import urllib3
 import random
 
@@ -47,7 +46,7 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     
     for attempt in range(3):
         try:
-            response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=120)  # 延長
+            response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=150)  # 延長
             result["status_code"] = response.status_code
             response.raise_for_status()
             data = response.json()
@@ -99,7 +98,7 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
                         a_tag = div.find('a', href=True)
                         if a_tag and a_tag.get('href') and a_tag.get('href').startswith('http') and not a_tag.get('href').startswith('https://www.google.'):
                             urls.append(a_tag.get('href'))
-                    unique_urls = list(dict.fromkeys(urls))[:10]
+                    unique_urls = list(dict.fromkeys(urls))[:5]  # テスト用に5件制限
                     st.success(f"【Bright Data】「{query}」から{len(unique_urls)}件のURLを抽出しました。")
                     return unique_urls
                 elif result_response.status_code != 202: return []
@@ -155,8 +154,9 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     manufacturer = product_info.get('Manufacturer', '')
     st.subheader(f"【統括エージェント】 \"{product_name}\" の情報収集を開始します。")
 
+    # コスモバイオ限定
     base_query = f"{manufacturer} {product_name}"
-    site_map = { 'コスモバイオ': 'cosmobio.co.jp', 'フナコシ': 'funakoshi.co.jp', 'AXEL': 'axel.as-1.co.jp', 'Selleck': 'selleck.co.jp', 'MCE': 'medchemexpress.com', 'Nakarai': 'nacalai.co.jp', 'FUJIFILM': 'labchem-wako.fujifilm.com', '関東化学': 'kanto.co.jp', 'TCI': 'tcichemicals.com', 'Merck': 'merck.com', '和光純薬': 'hpc-j.co.jp' }
+    site_map = {'コスモバイオ': 'cosmobio.co.jp'}
     search_queries = [f"site:{site_map[site_name]} {base_query}" for site_name in preferred_sites if site_name in site_map]
     search_queries.append(base_query)
 
@@ -179,26 +179,25 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
         progress_bar.progress(progress)
         status_text.text(f"URL抽出中... ({i+1}/{num_queries})")
     
-    unique_urls = list(dict.fromkeys(all_urls))
+    unique_urls = list(dict.fromkeys(all_urls))[:5]  # テスト用5件制限
     if not unique_urls: return [], []
     
-    st.info(f"{len(unique_urls)}件のHTMLページを並列で取得・分析します...")
+    st.info(f"{len(unique_urls)}件のHTMLページをコスモバイオから取得・分析します...")
     progress_bar.progress(0.2)
     status_text.text("URL抽出完了 (20%)")
 
-    # ステップ2: ページ取得 (20-80%)
+    # ステップ2: ページ取得 (20-80%) - 非並列ループでハング回避
     status_text.text("Webページを取得中...")
     progress_bar.progress(0.2)
     all_page_content_results, found_pages_data = [], []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
-        for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
-            all_page_content_results.append(future.result())
-            # 進捗更新
-            progress = 0.2 + (i + 1) / len(unique_urls) * 0.6
-            progress_bar.progress(progress)
-            status_text.text(f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
+    for i, url in enumerate(unique_urls):
+        status_text.text(f"Webページを取得中... ({i + 1}/{len(unique_urls)}): {url[:50]}...")
+        page_result = get_page_content_with_brightdata(url, brd_username, brd_password)
+        all_page_content_results.append(page_result)
+        # 進捗更新
+        progress = 0.2 + (i + 1) / len(unique_urls) * 0.6
+        progress_bar.progress(progress)
 
     # デバッグ用content長さログ
     short_contents = 0
@@ -220,17 +219,15 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     status_text.text("AIでページを分析中...")
     successful_contents = [res for res in all_page_content_results if res.get("content") and len(res.get("content", "")) > 1000 and not res.get("error")]
     if successful_contents:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future_to_content = {executor.submit(analyze_page_and_extract_info, content_res, product_name, gemini_api_key): content_res for content_res in successful_contents}
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_content)):
-                page_details = future.result()
-                if page_details and page_details.get("offers"):
-                    page_details['sourceUrl'] = future_to_content[future].get("url")
-                    found_pages_data.append(page_details)
-                # 進捗更新
-                progress = 0.8 + (i + 1) / len(successful_contents) * 0.2
-                progress_bar.progress(progress)
-                status_text.text(f"AIでページを分析中... ({i + 1}/{len(successful_contents)})")
+        for i, content_res in enumerate(successful_contents):
+            status_text.text(f"AIでページを分析中... ({i + 1}/{len(successful_contents)})")
+            page_details = analyze_page_and_extract_info(content_res, product_name, gemini_api_key)
+            if page_details and page_details.get("offers"):
+                page_details['sourceUrl'] = content_res.get("url")
+                found_pages_data.append(page_details)
+            # 進捗更新
+            progress = 0.8 + (i + 1) / len(successful_contents) * 0.2
+            progress_bar.progress(progress)
 
     progress_bar.progress(1.0)
     status_text.text("完了 (100%)")
@@ -241,7 +238,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
 # === Streamlit UI アプリケーション部分 ===
 # ==============================================================================
 st.set_page_config(layout="wide")
-st.title("製品調達AIエージェント")
+st.title("製品調達AIエージェント (コスモバイオ限定テスト版)")
 
 st.sidebar.header("APIキー設定")
 try:
@@ -270,7 +267,7 @@ if search_button:
     else:
         with st.spinner('AIエージェントが情報収集中...'):
             product_info = {'ProductName': product_name_input, 'Manufacturer': manufacturer_input}
-            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
+            preferred_sites = ['コスモバイオ']  # 限定
             
             pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password, preferred_sites, debug_mode=debug_mode_checkbox)
             
