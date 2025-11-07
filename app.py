@@ -25,10 +25,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Scraping Browserで生bodyテキスト抽出（ハング回避 + フォールバックGET）。
+    Scraping Browserで生bodyテキスト抽出（ハング回避 + リアルタイムログ）。
     """
     BRD_HOST = 'brd.superproxy.io'
-    BRD_PORT = 24000  # HTTP Browserポート
+    BRD_PORT = 24000
     proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
     headers = {
@@ -36,31 +36,52 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     }
     result = {"url": url, "status_code": None, "content": None, "error": None}
     
+    # リアルタイムログ (Streamlitコンテナ)
+    log_container = st.container()
+    with log_container:
+        st.write(f"  - 接続試行中: {url[:50]}...")
+    
     # 1. Scraping Browser試行 (POST)
     payload = {'url': url, 'renderJS': True, 'waitFor': 5000, 'proxy': 'residential'}
     try:
-        response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=30)
+        with log_container:
+            st.write(f"    - POST接続中...")
+        response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=15)  # 短く
         response.raise_for_status()
+        with log_container:
+            st.write(f"    - POST成功 (status: {response.status_code})")
         data = response.json()
         html = data.get('content', response.text)
     except Exception as e:
+        with log_container:
+            st.write(f"    - POST失敗: {str(e)[:50]}...")
         # 2. フォールバック: シンプルプロキシGET
         full_url = f'{proxy_url}/{url}'
         try:
-            response = requests.get(full_url, headers=headers, proxies=proxies, verify=False, timeout=30)
+            with log_container:
+                st.write(f"    - GETフォールバック中...")
+            response = requests.get(full_url, headers=headers, proxies=proxies, verify=False, timeout=15)
             response.raise_for_status()
+            with log_container:
+                st.write(f"    - GET成功 (status: {response.status_code})")
             html = response.text
         except Exception as e2:
+            with log_container:
+                st.write(f"    - GET失敗: {str(e2)[:50]}...")
             result["error"] = str(e) + "; fallback: " + str(e2)
             return result
     
     # テキスト抽出
+    with log_container:
+        st.write(f"    - テキスト抽出中...")
     soup = BeautifulSoup(html, 'html.parser')
     for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'iframe']):
         tag.decompose()
     result["content"] = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
     result["content"] = result["content"][:18000]
     result["status_code"] = 200
+    with log_container:
+        st.write(f"    - 抽出完了 (長さ: {len(result['content'])}文字)")
     return result
 
 
@@ -189,14 +210,16 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     status_text.text("Webページを取得中...")
     progress_bar.progress(0.2)
     all_page_content_results = []
+    log_container = st.container()  # リアルタイムログコンテナ
 
     for i, url in enumerate(unique_urls):
         status_text.text(f"Webページを取得中... ({i + 1}/{len(unique_urls)}): {url[:50]}...")
         page_result = get_page_content_with_brightdata(url, brd_username, brd_password)
         all_page_content_results.append(page_result)
         if page_result.get('error'):
-            st.warning(f"取得失敗: {url} - スキップして次へ")
-        # 進捗更新
+            with log_container:
+                st.warning(f"取得失敗: {url} - スキップして次へ")
+    # 進捗更新
         progress = 0.2 + (i + 1) / len(unique_urls) * 0.6
         progress_bar.progress(progress)
 
