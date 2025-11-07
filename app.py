@@ -1,4 +1,5 @@
 import streamlit as st
+import requests
 import google.generativeai as genai
 import time
 import re
@@ -8,6 +9,7 @@ from io import StringIO
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 import urllib.parse
+from urllib.parse import quote_plus
 
 # ページ設定
 st.set_page_config(
@@ -64,7 +66,20 @@ def setup_gemini():
         st.error(f"❌ Gemini API設定エラー: {str(e)}")
         return None
 
-# Browser API設定
+# SERP API設定（Google検索用）
+def check_serp_api_config():
+    try:
+        if "BRIGHTDATA_API_KEY" in st.secrets:
+            return {
+                'api_key': st.secrets["BRIGHTDATA_API_KEY"],
+                'zone_name': st.secrets.get("BRIGHTDATA_ZONE_NAME", "serp_api1"),
+                'available': True
+            }
+    except:
+        pass
+    return {'available': False}
+
+# Browser API設定（ページ取得用）
 BROWSER_API_CONFIG = {
     'ws_endpoint': 'wss://brd-customer-hl_3c49a4bb-zone-scraping_browser1:lokq2uz6vn5q@brd.superproxy.io:9222',
     'available': True
@@ -85,31 +100,36 @@ TARGET_SITES = {
     "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}
 }
 
-def search_google_with_browser(query, logger):
-    """Browser API経由でGoogle検索を実行"""
+def search_google_with_serp(query, serp_config, logger):
+    """SERP API経由でGoogle検索を実行"""
     try:
-        logger.log(f"  🔍 Google検索: {query[:60]}...", "DEBUG")
+        logger.log(f"  🔍 SERP API経由でGoogle検索: {query[:60]}...", "DEBUG")
         
-        search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&num=10&hl=ja"
+        api_url = "https://api.brightdata.com/request"
+        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=ja&gl=jp"
         
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(BROWSER_API_CONFIG['ws_endpoint'])
-            context = browser.contexts[0]
-            page = context.new_page()
-            
-            page.goto(search_url, timeout=30000, wait_until='domcontentloaded')
-            time.sleep(2)  # ページ読み込み待機
-            
-            html_content = page.content()
-            
-            page.close()
-            browser.close()
-            
-            logger.log(f"  ✅ Google検索成功 (HTML: {len(html_content)} chars)", "DEBUG")
-            return html_content
+        headers = {
+            'Authorization': f'Bearer {serp_config["api_key"]}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'zone': serp_config['zone_name'],
+            'url': search_url,
+            'format': 'raw'
+        }
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            logger.log(f"  ✅ Google検索成功 (HTML: {len(response.text)} chars)", "DEBUG")
+            return response.text
+        else:
+            logger.log(f"  ⚠️ SERP API HTTP {response.status_code}", "WARNING")
+            return None
             
     except Exception as e:
-        logger.log(f"  ❌ Google検索エラー: {str(e)}", "ERROR")
+        logger.log(f"  ❌ SERP API検索エラー: {str(e)}", "ERROR")
         return None
 
 def extract_urls_from_html(html_content, domain, logger):
@@ -221,12 +241,16 @@ def fetch_page_with_browser(url, logger):
         logger.log(f"  ❌ Browser API取得エラー: {str(e)}", "ERROR")
         return None
 
-def search_with_strategy(product_name, site_info, logger):
-    """検索戦略"""
+def search_with_strategy(product_name, site_info, serp_config, logger):
+    """検索戦略（SERP API使用）"""
     site_name = site_info["name"]
     domain = site_info["domain"]
     
     logger.log(f"🔍 {site_name} ({domain})を検索中", "INFO")
+    
+    if not serp_config['available']:
+        logger.log(f"  ❌ SERP API未設定", "ERROR")
+        return []
     
     search_queries = [
         f"{product_name} site:{domain}",
@@ -239,10 +263,10 @@ def search_with_strategy(product_name, site_info, logger):
     for query_idx, query in enumerate(search_queries):
         logger.log(f"  🔎 検索クエリ{query_idx+1}/3: {query}", "DEBUG")
         
-        html = search_google_with_browser(query, logger)
+        html = search_google_with_serp(query, serp_config, logger)
         
         if not html:
-            time.sleep(2)
+            time.sleep(1)
             continue
         
         urls = extract_urls_from_html(html, domain, logger)
@@ -258,7 +282,7 @@ def search_with_strategy(product_name, site_info, logger):
             logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
             break
         
-        time.sleep(2)
+        time.sleep(1)
     
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
@@ -370,11 +394,19 @@ def extract_product_info_from_page(html_content, product_name, url, model, logge
 def main():
     st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（Browser API版）</h1>', unsafe_allow_html=True)
     
-    if BROWSER_API_CONFIG['available']:
+    serp_config = check_serp_api_config()
+    
+    if serp_config['available'] and BROWSER_API_CONFIG['available']:
         st.markdown(
-            '<div class="api-status api-success">✅ Browser API接続: BRIGHT DATA (Zone: scraping_browser1)</div>',
+            f'<div class="api-status api-success">✅ SERP API: {serp_config["zone_name"]} | Browser API: scraping_browser1</div>',
             unsafe_allow_html=True
         )
+    else:
+        st.markdown(
+            '<div class="api-status api-warning">⚠️ API未設定</div>',
+            unsafe_allow_html=True
+        )
+        return
     
     col1, col2 = st.columns([3, 1])
     
@@ -407,7 +439,8 @@ def main():
         
         start_time = time.time()
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
-        logger.log(f"🌐 Browser API: BRIGHT DATA (Zone: scraping_browser1)", "INFO")
+        logger.log(f"🔍 Google検索: SERP API (Zone: {serp_config['zone_name']})", "INFO")
+        logger.log(f"🌐 ページ取得: Browser API (Zone: scraping_browser1)", "INFO")
         logger.log(f"🎯 対象サイト数: {max_sites}サイト", "INFO")
         
         model = setup_gemini()
@@ -421,7 +454,7 @@ def main():
         for site_idx, (site_key, site_info) in enumerate(sites_to_search.items(), 1):
             logger.log(f"\n--- サイト {site_idx}/{max_sites} ---", "INFO")
             
-            search_results = search_with_strategy(product_name, site_info, logger)
+            search_results = search_with_strategy(product_name, site_info, serp_config, logger)
             
             if not search_results:
                 logger.log(f"⏭️  次のサイトへ", "DEBUG")
