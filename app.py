@@ -111,19 +111,13 @@ def check_serp_api_config():
     try:
         # APIキー認証
         if "BRIGHTDATA_API_KEY" in st.secrets:
+            # ゾーン名も確認
+            zone_name = st.secrets.get("BRIGHTDATA_ZONE_NAME", "serp_api1")
             return {
                 'provider': 'brightdata',
                 'auth_type': 'api_key',
                 'api_key': st.secrets["BRIGHTDATA_API_KEY"],
-                'available': True
-            }
-        # Username/Password認証（フォールバック）
-        elif "BRIGHTDATA_USERNAME" in st.secrets and "BRIGHTDATA_PASSWORD" in st.secrets:
-            return {
-                'provider': 'brightdata',
-                'auth_type': 'basic',
-                'username': st.secrets["BRIGHTDATA_USERNAME"],
-                'password': st.secrets["BRIGHTDATA_PASSWORD"],
+                'zone_name': zone_name,
                 'available': True
             }
     except:
@@ -150,68 +144,44 @@ TARGET_SITES = {
 }
 
 def search_with_brightdata_serp(query, serp_config, logger):
-    """Bright Data SERP APIで検索（改善版）"""
+    """Bright Data SERP APIで検索（正しいエンドポイント）"""
     try:
         logger.log(f"  🔌 Bright Data SERP API使用", "DEBUG")
+        logger.log(f"  🔑 APIキー認証を使用", "DEBUG")
         
-        # 認証タイプに応じてエンドポイントとパラメータを設定
-        if serp_config.get('auth_type') == 'api_key':
-            # APIキー認証
-            logger.log(f"  🔑 APIキー認証を使用", "DEBUG")
-            
-            # Bright Data SERP APIエンドポイント（正しい形式）
-            api_url = "https://api.brightdata.com/serp/google"
-            
-            # ヘッダーにAPIキーを設定
-            headers = {
-                'Authorization': f'Bearer {serp_config["api_key"]}',
-                'Content-Type': 'application/json'
-            }
-            
-            # リクエストパラメータ
-            params = {
-                'q': query,
-                'num': 10,
-                'hl': 'ja',
-                'gl': 'jp',
-            }
-            
-            # APIリクエスト
-            response = requests.get(
-                api_url,
-                headers=headers,
-                params=params,
-                timeout=30
-            )
-            
-        else:
-            # Basic認証（Username/Password）
-            logger.log(f"  🔐 Basic認証を使用", "DEBUG")
-            
-            api_url = "https://api.brightdata.com/serp/google"
-            
-            # 認証情報
-            auth = (serp_config['username'], serp_config['password'])
-            
-            # リクエストパラメータ
-            params = {
-                'q': query,
-                'num': 10,
-                'hl': 'ja',
-                'gl': 'jp',
-            }
-            
-            # APIリクエスト
-            response = requests.get(
-                api_url,
-                auth=auth,
-                params=params,
-                timeout=30
-            )
+        # 正しいエンドポイント
+        api_url = "https://api.brightdata.com/request"
+        
+        # Google検索URL作成
+        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=ja&gl=jp"
+        
+        # ヘッダー
+        headers = {
+            'Authorization': f'Bearer {serp_config["api_key"]}',
+            'Content-Type': 'application/json'
+        }
+        
+        # ペイロード
+        payload = {
+            'zone': serp_config['zone_name'],
+            'url': search_url,
+            'format': 'raw'
+        }
+        
+        logger.log(f"  📡 検索URL: {search_url[:80]}...", "DEBUG")
+        
+        # POSTリクエスト
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
         
         if response.status_code == 200:
             logger.log(f"  ✓ SERP API応答成功", "DEBUG")
-            return response.json()
+            # rawフォーマットの場合、HTMLが返される
+            return {'html': response.text, 'status': 'success'}
         elif response.status_code == 401:
             logger.log(f"  ❌ 認証エラー: APIキーを確認してください", "ERROR")
             return None
@@ -230,38 +200,44 @@ def search_with_brightdata_serp(query, serp_config, logger):
         logger.log(f"  ❌ SERP APIエラー: {str(e)}", "ERROR")
         return None
 
-def extract_urls_from_serp_response(serp_data, domain, logger):
-    """SERP APIレスポンスからURLを抽出"""
+def extract_urls_from_html(html_content, domain, logger):
+    """HTMLからURLを抽出"""
     urls = []
     
     try:
-        # Bright Data SERP APIのレスポンス構造に対応
-        if 'organic_results' in serp_data:
-            for result in serp_data['organic_results'][:10]:
-                url = result.get('url', '')
-                
-                # ドメインチェック
-                if domain in url:
-                    urls.append({
-                        'url': url,
-                        'title': result.get('title', ''),
-                        'snippet': result.get('snippet', '')
-                    })
+        # URLパターン
+        patterns = [
+            rf'https?://(?:www\.)?{re.escape(domain)}[^\s<>"\']*',
+            rf'href="(https?://(?:www\.)?{re.escape(domain)}[^"]*)"',
+            rf"href='(https?://(?:www\.)?{re.escape(domain)}[^']*)'",
+        ]
         
-        # 他の一般的なSERP APIフォーマット
-        elif 'results' in serp_data:
-            for result in serp_data['results'][:10]:
-                url = result.get('link', '') or result.get('url', '')
+        all_urls = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            for match in matches:
+                url = match[0] if isinstance(match, tuple) else match
+                if url.startswith('http') and len(url) > 20:
+                    all_urls.add(url)
+        
+        # タイトルとスニペットも抽出
+        # Googleの検索結果構造を解析
+        result_pattern = r'<div[^>]*class="[^"]*g[^"]*"[^>]*>(.*?)</div>'
+        results = re.findall(result_pattern, html_content, re.DOTALL)
+        
+        for url in list(all_urls)[:10]:
+            # 除外パターン
+            if any(x in url.lower() for x in ['google.com', 'youtube.com', 'facebook.com']):
+                continue
                 
-                if domain in url:
-                    urls.append({
-                        'url': url,
-                        'title': result.get('title', ''),
-                        'snippet': result.get('snippet', '') or result.get('description', '')
-                    })
+            urls.append({
+                'url': url,
+                'title': 'N/A',  # HTMLパース簡略化のため
+                'snippet': 'N/A'
+            })
         
         if urls:
-            logger.log(f"  ✓ SERP APIから{len(urls)}件のURL抽出", "INFO")
+            logger.log(f"  ✓ HTMLから{len(urls)}件のURL抽出", "INFO")
         else:
             logger.log(f"  ℹ️ 該当URLなし", "DEBUG")
         
@@ -303,8 +279,8 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
             time.sleep(2)
             continue
         
-        # URLを抽出
-        urls = extract_urls_from_serp_response(serp_data, domain, logger)
+        # HTMLからURLを抽出
+        urls = extract_urls_from_html(serp_data['html'], domain, logger)
         
         if urls:
             for url_data in urls[:5]:
@@ -313,7 +289,7 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
                     'site': site_name,
                     'title': url_data['title'],
                     'snippet': url_data['snippet'],
-                    'serp_data': serp_data
+                    'html': serp_data['html']
                 })
             
             logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
@@ -521,35 +497,29 @@ def display_product_card(product, idx):
     st.markdown('</div>', unsafe_allow_html=True)
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 v2）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 v3）</h1>', unsafe_allow_html=True)
     
     # SERP API設定チェック
     serp_config = check_serp_api_config()
     
     # API状態表示
     if serp_config['available']:
-        auth_type_display = "APIキー" if serp_config.get('auth_type') == 'api_key' else "Basic認証"
         st.markdown(
-            f'<div class="api-status api-success">✅ SERP API接続: {serp_config["provider"].upper()} ({auth_type_display})</div>',
+            f'<div class="api-status api-success">✅ SERP API接続: BRIGHTDATA (Zone: {serp_config["zone_name"]})</div>',
             unsafe_allow_html=True
         )
     else:
         st.markdown(
-            '<div class="api-status api-warning">⚠️ SERP API未設定: secrets.tomlにBRIGHTDATA_API_KEYまたはBRIGHTDATA_USERNAME/PASSWORDを追加してください</div>',
+            '<div class="api-status api-warning">⚠️ SERP API未設定: secrets.tomlにBRIGHTDATA_API_KEYを追加してください</div>',
             unsafe_allow_html=True
         )
         st.info("""
         **SERP API設定方法:**
         
-        **オプション1: APIキー認証（推奨）**
+        `.streamlit/secrets.toml`に以下を追加:
         ```toml
         BRIGHTDATA_API_KEY = "your_api_key"
-        ```
-        
-        **オプション2: Username/Password認証**
-        ```toml
-        BRIGHTDATA_USERNAME = "your_username"
-        BRIGHTDATA_PASSWORD = "your_password"
+        BRIGHTDATA_ZONE_NAME = "serp_api1"  # オプション（デフォルト: serp_api1）
         ```
         """)
     
@@ -558,7 +528,7 @@ def main():
     with col1:
         product_name = st.text_input(
             "🔍 製品名を入力してください",
-            value="Quinpirole",
+            value="Y-27632",
             placeholder="例: Y-27632, DMSO, Trizol, Quinpirole"
         )
     
@@ -567,7 +537,7 @@ def main():
             "最大検索サイト数",
             min_value=1,
             max_value=11,
-            value=5,
+            value=3,
             step=1
         )
     
@@ -587,8 +557,7 @@ def main():
         
         start_time = time.time()
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
-        auth_type_display = "APIキー" if serp_config.get('auth_type') == 'api_key' else "Basic認証"
-        logger.log(f"🔌 SERP API: {serp_config['provider'].upper()} ({auth_type_display})", "INFO")
+        logger.log(f"🔌 SERP API: BRIGHTDATA (Zone: {serp_config['zone_name']})", "INFO")
         
         model = setup_gemini()
         if not model:
