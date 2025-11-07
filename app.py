@@ -65,7 +65,7 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     return result
 
 
-def search_product_urls_with_brightdata(query: str, api_key: str) -> dict:
+def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
     """Bright DataのSERP APIでGoogle検索を実行し、URLリストを取得する。"""
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
     headers = {
@@ -160,50 +160,80 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     search_queries = [f"site:{site_map[site_name]} {base_query}" for site_name in preferred_sites if site_name in site_map]
     search_queries.append(base_query)
 
+    # 進捗バー初期化 (0%)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    # ステップ1: URL抽出 (0-20%)
+    status_text.text("URL抽出中...")
+    progress_bar.progress(0.1)
     all_urls = []
-    for query in search_queries:
+    num_queries = len(search_queries)
+    for i, query in enumerate(search_queries):
         urls = search_product_urls_with_brightdata(query, brightdata_api_key)
         all_urls.extend(urls)
         if urls and debug_mode:
             st.info(f"抽出URLサンプル: {urls[:3]}")
+        # 進捗更新
+        progress = 0.1 + (i / num_queries) * 0.1
+        progress_bar.progress(progress)
+        status_text.text(f"URL抽出中... ({i+1}/{num_queries})")
     
     unique_urls = list(dict.fromkeys(all_urls))
     if not unique_urls: return [], []
     
     st.info(f"{len(unique_urls)}件のHTMLページを並列で取得・分析します...")
-    my_bar = st.progress(0, text="Webページを取得中...")
+    progress_bar.progress(0.2)
+    status_text.text("URL抽出完了 (20%)")
+
+    # ステップ2: ページ取得 (20-80%)
+    status_text.text("Webページを取得中...")
+    progress_bar.progress(0.2)
     all_page_content_results, found_pages_data = [], []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:  # ハング回避
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
-            my_bar.progress((i + 1) / len(unique_urls), text=f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
+            # 進捗更新
+            progress = 0.2 + (i + 1) / len(unique_urls) * 0.6
+            progress_bar.progress(progress)
+            status_text.text(f"Webページを取得中... ({i + 1}/{len(unique_urls)})")
 
-        # デバッグ用content長さログ
-        short_contents = 0
-        for res in all_page_content_results:
-            if res.get("content"):
-                content_len = len(res["content"])
-                if debug_mode:
-                    st.info(f"URL: {res['url']}, Content長: {content_len}文字")
-                if content_len < 1000:
-                    short_contents += 1
-                    st.warning(f"短いコンテンツ検知: {res['url']} ({content_len}文字) - ブロックの可能性")
-        if short_contents > 0:
-            st.warning(f"合計{short_contents}件の短いページを検知。JSレンダリング不足かブロック？")
+    # デバッグ用content長さログ
+    short_contents = 0
+    for res in all_page_content_results:
+        if res.get("content"):
+            content_len = len(res["content"])
+            if debug_mode:
+                st.info(f"URL: {res['url']}, Content長: {content_len}文字")
+            if content_len < 1000:
+                short_contents += 1
+                st.warning(f"短いコンテンツ検知: {res['url']} ({content_len}文字) - ブロックの可能性")
+    if short_contents > 0:
+        st.warning(f"合計{short_contents}件の短いページを検知。JSレンダリング不足かブロック？")
 
-        successful_contents = [res for res in all_page_content_results if res.get("content") and len(res.get("content", "")) > 1000 and not res.get("error")]
-        if successful_contents:
-            my_bar.progress(0, text="AIでページを分析中...")
+    progress_bar.progress(0.8)
+    status_text.text("ページ取得完了 (80%)")
+
+    # ステップ3: AI解析 (80-100%)
+    status_text.text("AIでページを分析中...")
+    successful_contents = [res for res in all_page_content_results if res.get("content") and len(res.get("content", "")) > 1000 and not res.get("error")]
+    if successful_contents:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future_to_content = {executor.submit(analyze_page_and_extract_info, content_res, product_name, gemini_api_key): content_res for content_res in successful_contents}
             for i, future in enumerate(concurrent.futures.as_completed(future_to_content)):
                 page_details = future.result()
                 if page_details and page_details.get("offers"):
                     page_details['sourceUrl'] = future_to_content[future].get("url")
                     found_pages_data.append(page_details)
-                my_bar.progress((i + 1) / len(successful_contents), text=f"AIでページを分析中... ({i + 1}/{len(successful_contents)})")
+                # 進捗更新
+                progress = 0.8 + (i + 1) / len(successful_contents) * 0.2
+                progress_bar.progress(progress)
+                status_text.text(f"AIでページを分析中... ({i + 1}/{len(successful_contents)})")
 
+    progress_bar.progress(1.0)
+    status_text.text("完了 (100%)")
     st.success(f"【統括エージェント】{len(found_pages_data)}ページから製品情報を抽出しました。")
     return found_pages_data, all_page_content_results
 
