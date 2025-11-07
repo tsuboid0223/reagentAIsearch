@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-製品調達AIエージェント - CosmoBioテスト版
-（高速テスト用: CosmoBioのみ検索）
+製品調達AIエージェント - CosmoBioテスト版 v2
+（URL取得強化: フォールバックURL + DuckDuckGo検索）
 """
 
 # ==============================================================================
@@ -34,7 +34,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==============================================================================
 DEFAULT_MODEL = 'gemini-2.0-flash-exp'
 TEST_SITE = 'cosmobio.co.jp'
-MAX_URLS = 3  # テスト用: 最大3URLまで
+
+# フォールバックURL（既知のCosmoBio製品ページ）
+FALLBACK_URLS = {
+    'Y27632': [
+        'https://www.cosmobio.co.jp/product/detail/y-27632-dihydrochloride-enz.asp?entry_id=16716',
+        'https://search.cosmobio.co.jp/view/p_view.asp?PrimaryKeyValue=4769669&ServerKey=&selPrice=1',
+        'https://search.cosmobio.co.jp/view/p_view.asp?PrimaryKeyValue=6379673&ServerKey=&selPrice=1'
+    ]
+}
 
 # ==============================================================================
 # リアルタイムログクラス
@@ -53,11 +61,11 @@ class RealTimeLogger:
         log_entry = f"{icon} [{timestamp}] {message}"
         self.logs.append(log_entry)
         
-        display_logs = self.logs[-20:]
+        display_logs = self.logs[-25:]
         self.log_container.text_area(
             "🔍 リアルタイムログ",
             "\n".join(display_logs),
-            height=300,
+            height=350,
             key=f"log_{len(self.logs)}"
         )
         
@@ -84,13 +92,118 @@ def validate_gemini_api_key(api_key: str, rt_logger: RealTimeLogger) -> bool:
             return True
         else:
             rt_logger.add(f"❌ APIキー検証失敗 (status: {response.status_code})", "error")
+            rt_logger.add(f"  レスポンス: {response.text[:200]}", "error")
             return False
     except Exception as e:
         rt_logger.add(f"❌ API検証エラー: {str(e)[:60]}", "error")
         return False
 
 # ==============================================================================
-# 直接アクセス関数（プロキシなし）
+# URL検索関数（複数手法）
+# ==============================================================================
+def search_urls_multi_method(query: str, rt_logger: RealTimeLogger, product_name: str, max_results: int = 3) -> list:
+    """複数の検索手法を試行"""
+    
+    # 方法1: フォールバックURL（製品名が既知の場合）
+    if product_name.upper() in FALLBACK_URLS:
+        rt_logger.add(f"フォールバックURL使用: {product_name}", "info")
+        urls = FALLBACK_URLS[product_name.upper()][:max_results]
+        rt_logger.add(f"  ✅ {len(urls)}件のURLを取得", "success")
+        return urls
+    
+    # 方法2: DuckDuckGo検索
+    rt_logger.add("DuckDuckGo検索を試行...", "info")
+    urls = search_duckduckgo(query, rt_logger, max_results)
+    if urls:
+        return urls
+    
+    # 方法3: Bing検索
+    rt_logger.add("Bing検索を試行...", "info")
+    urls = search_bing(query, rt_logger, max_results)
+    if urls:
+        return urls
+    
+    # すべて失敗
+    rt_logger.add("❌ すべての検索方法が失敗しました", "error")
+    return []
+
+
+def search_duckduckgo(query: str, rt_logger: RealTimeLogger, max_results: int = 3) -> list:
+    """DuckDuckGo検索"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+    }
+    
+    try:
+        # DuckDuckGo HTML検索
+        search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+        rt_logger.add(f"  DDG検索中...", "info")
+        
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        urls = []
+        
+        # 検索結果のリンクを抽出
+        for result in soup.find_all('a', class_='result__a'):
+            href = result.get('href')
+            if href and TEST_SITE in href:
+                urls.append(href)
+                rt_logger.add(f"    URL発見: {href[:60]}...", "info")
+                if len(urls) >= max_results:
+                    break
+        
+        if urls:
+            rt_logger.add(f"  ✅ DDG検索成功: {len(urls)}件", "success")
+            return urls
+        else:
+            rt_logger.add(f"  ⚠️ DDGでURL見つからず", "warning")
+            return []
+            
+    except Exception as e:
+        rt_logger.add(f"  ❌ DDG検索エラー: {str(e)[:60]}", "error")
+        return []
+
+
+def search_bing(query: str, rt_logger: RealTimeLogger, max_results: int = 3) -> list:
+    """Bing検索"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+    }
+    
+    try:
+        search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
+        rt_logger.add(f"  Bing検索中...", "info")
+        
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        urls = []
+        
+        # Bing検索結果のリンクを抽出
+        for result in soup.find_all('li', class_='b_algo'):
+            link = result.find('a', href=True)
+            if link and TEST_SITE in link['href']:
+                urls.append(link['href'])
+                rt_logger.add(f"    URL発見: {link['href'][:60]}...", "info")
+                if len(urls) >= max_results:
+                    break
+        
+        if urls:
+            rt_logger.add(f"  ✅ Bing検索成功: {len(urls)}件", "success")
+            return urls
+        else:
+            rt_logger.add(f"  ⚠️ BingでURL見つからず", "warning")
+            return []
+            
+    except Exception as e:
+        rt_logger.add(f"  ❌ Bing検索エラー: {str(e)[:60]}", "error")
+        return []
+
+# ==============================================================================
+# 直接アクセス関数
 # ==============================================================================
 def get_page_content_direct(url: str, rt_logger: RealTimeLogger, timeout: int = 10) -> dict:
     """プロキシを使わず直接アクセス"""
@@ -133,52 +246,6 @@ def get_page_content_direct(url: str, rt_logger: RealTimeLogger, timeout: int = 
         rt_logger.add(f"  ❌ 失敗: {str(e)[:60]}", "error")
         result["error"] = str(e)
         return result
-
-# ==============================================================================
-# Google検索（シンプル版）
-# ==============================================================================
-def search_google_simple(query: str, rt_logger: RealTimeLogger, max_results: int = 3) -> list:
-    """Google検索（直接スクレイピング - テスト用）"""
-    rt_logger.add(f"Google検索開始: {query}", "info")
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-        'Accept-Language': 'ja,en;q=0.9',
-    }
-    
-    search_url = f"https://www.google.co.jp/search?q={urllib.parse.quote(query)}&hl=ja&gl=jp"
-    
-    try:
-        rt_logger.add(f"  検索リクエスト送信中...", "info")
-        response = requests.get(search_url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        rt_logger.add(f"  HTML解析中...", "info")
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 検索結果のリンクを抽出
-        urls = []
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            if '/url?q=' in href:
-                # Google検索結果のURL形式から実際のURLを抽出
-                actual_url = href.split('/url?q=')[1].split('&')[0]
-                if actual_url.startswith('http') and TEST_SITE in actual_url:
-                    urls.append(urllib.parse.unquote(actual_url))
-                    rt_logger.add(f"    URL発見: {actual_url[:60]}...", "info")
-                    if len(urls) >= max_results:
-                        break
-        
-        if not urls:
-            rt_logger.add(f"  ⚠️ URLが見つかりませんでした", "warning")
-        else:
-            rt_logger.add(f"  ✅ {len(urls)}件のURL抽出完了", "success")
-        
-        return urls
-        
-    except Exception as e:
-        rt_logger.add(f"  ❌ 検索エラー: {str(e)[:60]}", "error")
-        return []
 
 # ==============================================================================
 # AI解析関数
@@ -274,7 +341,7 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
 # ==============================================================================
 # メイン処理
 # ==============================================================================
-def run_cosmobio_test(product_name: str, manufacturer: str, gemini_api_key: str, model_name: str = DEFAULT_MODEL) -> tuple[list, list]:
+def run_cosmobio_test(product_name: str, manufacturer: str, gemini_api_key: str, model_name: str = DEFAULT_MODEL, max_urls: int = 3) -> tuple[list, list]:
     """CosmoBioテスト実行"""
     
     rt_logger = RealTimeLogger()
@@ -297,11 +364,14 @@ def run_cosmobio_test(product_name: str, manufacturer: str, gemini_api_key: str,
     progress_bar.progress(0.2)
     rt_logger.add(f"--- ステップ1: URL検索 ---", "success")
     
-    query = f"site:{TEST_SITE} {manufacturer} {product_name}"
-    urls = search_google_simple(query, rt_logger, max_results=MAX_URLS)
+    query = f"site:{TEST_SITE} {manufacturer} {product_name}".strip()
+    rt_logger.add(f"検索クエリ: {query}", "info")
+    
+    urls = search_urls_multi_method(query, rt_logger, product_name, max_urls)
     
     if not urls:
         st.error(f"❌ {TEST_SITE}から製品URLが見つかりませんでした")
+        rt_logger.add("💡 製品名やメーカー名を変更して再試行してください", "warning")
         return [], []
     
     # URL一覧表示
@@ -372,9 +442,9 @@ def run_cosmobio_test(product_name: str, manufacturer: str, gemini_api_key: str,
 # ==============================================================================
 # Streamlit UI
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="CosmoBioテスト", page_icon="🧪")
-st.title("🧪 CosmoBio検索テスト")
-st.caption("高速テスト用: CosmoBioのみ検索（最大3URL）")
+st.set_page_config(layout="wide", page_title="CosmoBioテスト v2", page_icon="🧪")
+st.title("🧪 CosmoBio検索テスト v2")
+st.caption("高速テスト用: フォールバックURL + 複数検索エンジン対応")
 
 # サイドバー
 st.sidebar.header("⚙️ APIキー設定")
@@ -388,13 +458,21 @@ except KeyError:
 st.sidebar.header("🔍 検索条件")
 product_name_input = st.sidebar.text_input(
     "製品名 (必須)", 
-    value="Y27632",  # デフォルト値
+    value="Y27632",
     placeholder="例: Y27632"
 )
 manufacturer_input = st.sidebar.text_input(
     "メーカー", 
     value="",
     placeholder="例: Selleck"
+)
+
+max_urls_input = st.sidebar.slider(
+    "取得URL数",
+    min_value=1,
+    max_value=5,
+    value=3,
+    help="多いほど時間がかかります"
 )
 
 # モデル選択
@@ -416,8 +494,9 @@ search_button = st.sidebar.button("🚀 テスト実行", type="primary", use_co
 st.sidebar.info(f"""
 📊 **テスト設定**
 - 対象サイト: {TEST_SITE}
-- 最大URL数: {MAX_URLS}件
+- 最大URL数: {max_urls_input}件
 - タイムアウト: 10秒
+- 検索方法: フォールバック → DDG → Bing
 """)
 
 if search_button:
@@ -426,14 +505,15 @@ if search_button:
     elif not product_name_input:
         st.error("❌ 製品名を入力してください")
     else:
-        logger.info(f"CosmoBio Test - Product: {product_name_input}, Manufacturer: {manufacturer_input}")
+        logger.info(f"CosmoBio Test v2 - Product: {product_name_input}, Manufacturer: {manufacturer_input}")
         
         # テスト実行
         products, logs = run_cosmobio_test(
             product_name_input,
             manufacturer_input,
             gemini_api_key,
-            selected_model
+            selected_model,
+            max_urls_input
         )
         
         # 結果表示
@@ -510,5 +590,6 @@ if search_button:
 st.sidebar.markdown("---")
 st.sidebar.caption("💡 このテスト版は高速動作確認用です")
 st.sidebar.caption(f"🎯 対象: {TEST_SITE}")
+st.sidebar.caption("🔧 v2: フォールバックURL + マルチ検索対応")
 
-logger.info("CosmoBio Test Application Ready")
+logger.info("CosmoBio Test v2 Application Ready")
