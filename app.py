@@ -206,19 +206,55 @@ def extract_urls_from_html(html_content, domain, logger):
         logger.log(f"  ❌ URL抽出エラー: {str(e)}", "ERROR")
         return []
 
+def clean_url(url):
+    """URLのクリーニング"""
+    try:
+        import html as html_module
+        
+        # HTMLエンティティをデコード（&amp; → &）
+        url = html_module.unescape(url)
+        
+        # URLエンコーディングをデコード（%26 → &）
+        url = urllib.parse.unquote(url)
+        
+        # Googleトラッキングパラメータを削除
+        if '&ved=' in url:
+            url = url.split('&ved=')[0]
+        elif '?ved=' in url:
+            url = url.split('?ved=')[0]
+        
+        # その他のトラッキングパラメータ
+        for param in ['&hl=', '?hl=', '&sl=', '&tl=', '&client=', '&prev=']:
+            if param in url:
+                url = url.split(param)[0]
+        
+        # 末尾の記号を削除
+        url = url.rstrip('.,;:)"\'')  
+        
+        return url
+    except Exception as e:
+        return url
+
 def fetch_page_with_browser(url, logger):
     """Browser API経由でページ取得"""
     try:
+        # URLクリーニング（重要！）
+        clean_url_str = clean_url(url)
+        
         logger.log(f"  🌐 Browser API経由でページ取得", "DEBUG")
-        logger.log(f"    URL: {url[:80]}...", "DEBUG")
+        if url != clean_url_str:
+            logger.log(f"    元URL: {url[:80]}...", "DEBUG")
+            logger.log(f"    クリーンURL: {clean_url_str[:80]}...", "DEBUG")
+        else:
+            logger.log(f"    URL: {clean_url_str[:80]}...", "DEBUG")
         
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(BROWSER_API_CONFIG['ws_endpoint'])
             context = browser.contexts[0]
             page = context.new_page()
             
-            # ページに移動
-            page.goto(url, timeout=45000, wait_until='networkidle')
+            # ページに移動（クリーンURLを使用）
+            page.goto(clean_url_str, timeout=45000, wait_until='networkidle')
             time.sleep(2)  # 追加の読み込み待機
             
             # HTMLを取得
@@ -346,6 +382,10 @@ def extract_product_info_from_page(html_content, product_name, url, model, logge
         response_text = response.text.strip()
         
         logger.log(f"  📨 Gemini API応答受信 ({len(response_text)} chars)", "DEBUG")
+        
+        # レスポンスが異常に短い場合は詳細を表示
+        if len(response_text) < 200:
+            logger.log(f"  ⚠️ Geminiレスポンスが短い: {response_text}", "WARNING")
         
         # JSONクリーニング
         response_text = re.sub(r'^```json\s*', '', response_text)
