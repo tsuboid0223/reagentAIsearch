@@ -25,7 +25,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Scraping Browserで生bodyテキスト抽出（ハング回避 + フォールバック）。
+    Scraping Browserで生bodyテキスト抽出（ハング回避 + フォールバックGET）。
     """
     BRD_HOST = 'brd.superproxy.io'
     BRD_PORT = 24000  # HTTP Browserポート
@@ -36,20 +36,15 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     }
     result = {"url": url, "status_code": None, "content": None, "error": None}
     
-    # 1. Scraping Browser試行
-    payload = {
-        'url': url,
-        'renderJS': True,
-        'waitFor': 3000,
-        'proxy': 'residential'  # 住宅IP優先
-    }
+    # 1. Scraping Browser試行 (POST)
+    payload = {'url': url, 'renderJS': True, 'waitFor': 5000, 'proxy': 'residential'}
     try:
         response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=30)
         response.raise_for_status()
         data = response.json()
         html = data.get('content', response.text)
     except Exception as e:
-        # フォールバック: シンプルプロキシGET
+        # 2. フォールバック: シンプルプロキシGET
         full_url = f'{proxy_url}/{url}'
         try:
             response = requests.get(full_url, headers=headers, proxies=proxies, verify=False, timeout=30)
@@ -193,7 +188,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     # ステップ2: ページ取得 (20-80%) - 非並列ループでハング回避
     status_text.text("Webページを取得中...")
     progress_bar.progress(0.2)
-    all_page_content_results, found_pages_data = [], []
+    all_page_content_results = []
 
     for i, url in enumerate(unique_urls):
         status_text.text(f"Webページを取得中... ({i + 1}/{len(unique_urls)}): {url[:50]}...")
@@ -221,6 +216,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
 
     # ステップ3: AI解析 (80-100%)
     status_text.text("AIでページを分析中...")
+    found_pages_data = []
     successful_contents = [res for res in all_page_content_results if res.get("content") and len(res.get("content", "")) > 1000 and not res.get("error")]
     if successful_contents:
         for i, content_res in enumerate(successful_contents):
