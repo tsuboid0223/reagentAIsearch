@@ -25,7 +25,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Scraping Browserで生bodyテキスト抽出（ハング回避 + リアルタイムログ）。
+    Scraping BrowserでbodyText抽出 (Playground再現、hanging回避)。
     """
     BRD_HOST = 'brd.superproxy.io'
     BRD_PORT = 24000
@@ -36,40 +36,36 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     }
     result = {"url": url, "status_code": None, "content": None, "error": None}
     
-    # リアルタイムログ (Streamlitコンテナ)
-    log_container = st.container()
-    with log_container:
-        st.write(f"  - 接続試行中: {url[:50]}...")
+    payload = {
+        'url': url,
+        'renderJS': True,
+        'waitFor': 5000,
+        'waitForSelector': 'table',  # テーブル待機
+        'proxy': 'residential'
+    }
     
-    # 1. Scraping Browser試行 (POST)
-    payload = {'url': url, 'renderJS': True, 'waitFor': 5000, 'proxy': 'residential'}
-    try:
-        with log_container:
-            st.write(f"    - POST接続中...")
-        response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=15)  # 短く
-        response.raise_for_status()
-        with log_container:
-            st.write(f"    - POST成功 (status: {response.status_code})")
-        data = response.json()
-        html = data.get('content', response.text)
-    except Exception as e:
-        with log_container:
-            st.write(f"    - POST失敗: {str(e)[:50]}...")
-        # 2. フォールバック: シンプルプロキシGET
-        full_url = f'{proxy_url}/{url}'
+    for attempt in range(3):
         try:
-            with log_container:
-                st.write(f"    - GETフォールバック中...")
-            response = requests.get(full_url, headers=headers, proxies=proxies, verify=False, timeout=15)
+            response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=30)
             response.raise_for_status()
-            with log_container:
-                st.write(f"    - GET成功 (status: {response.status_code})")
-            html = response.text
-        except Exception as e2:
-            with log_container:
-                st.write(f"    - GET失敗: {str(e2)[:50]}...")
-            result["error"] = str(e) + "; fallback: " + str(e2)
+            data = response.json()
+            html = data.get('content', response.text)
+            soup = BeautifulSoup(html, 'html.parser')
+            for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'iframe']):
+                tag.decompose()
+            # bodyText抽出 (テーブル強調)
+            body_text = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
+            # テーブル部分を強調抽出 (オプション)
+            table = soup.find('table')
+            table_text = table.get_text(strip=True) if table else 'テーブルなし'
+            result["content"] = f"{body_text} [TABLE: {table_text}]"  # テーブル追加
+            result["content"] = result["content"][:18000]
+            result["error"] = None
             return result
+        except Exception as e:
+            result["error"] = str(e)
+            time.sleep(random.uniform(5, 10))
+    return result
     
     # テキスト抽出
     with log_container:
