@@ -56,7 +56,7 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     
     # テキスト抽出
     soup = BeautifulSoup(html, 'html.parser')
-    for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
+    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'iframe']):
         tag.decompose()
     result["content"] = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
     result["content"] = result["content"][:18000]
