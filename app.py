@@ -5,13 +5,14 @@ import time
 import re
 import json
 import pandas as pd
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, unquote
 from io import StringIO
 from datetime import datetime
+import html
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬 価格比較システム（SERP API版 - Ultimate）",
+    page_title="化学試薬 価格比較システム（403/404対策版）",
     page_icon="🧪",
     layout="wide"
 )
@@ -116,11 +117,102 @@ TARGET_SITES = {
     "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}
 }
 
+def clean_url(url):
+    """URLのクリーニング - HTMLエンティティのデコードとパラメータ削除"""
+    try:
+        # HTMLエンティティをデコード（&amp; → &）
+        url = html.unescape(url)
+        
+        # URLデコード（%20 → スペース等）
+        url = unquote(url)
+        
+        # URLをパース
+        parsed = urlparse(url)
+        
+        # クエリパラメータを完全に削除
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        
+        # 末尾のスラッシュを削除
+        clean_url = clean_url.rstrip('/')
+        
+        # 末尾の記号を削除
+        clean_url = clean_url.rstrip('.,;:)"\'')
+        
+        return clean_url
+    except Exception as e:
+        return url
+
+def fetch_page_with_brightdata(url, serp_config, logger):
+    """Bright Data経由でページを取得（403/404対策）"""
+    try:
+        logger.log(f"  🌐 Bright Data経由でページ取得", "DEBUG")
+        
+        api_url = "https://api.brightdata.com/request"
+        
+        headers = {
+            'Authorization': f'Bearer {serp_config["api_key"]}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'zone': serp_config['zone_name'],
+            'url': url,
+            'format': 'raw'
+        }
+        
+        logger.log(f"    リクエストURL: {url[:100]}...", "DEBUG")
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=45)
+        
+        if response.status_code == 200:
+            logger.log(f"  ✅ ページ取得成功 (HTML: {len(response.text)} chars)", "INFO")
+            return response.text
+        else:
+            logger.log(f"  ⚠️ Bright Data HTTP {response.status_code}", "WARNING")
+            return None
+            
+    except Exception as e:
+        logger.log(f"  ❌ Bright Data取得エラー: {str(e)}", "ERROR")
+        return None
+
+def fetch_page_direct(url, logger):
+    """直接HTTPリクエストでページ取得（フォールバック）"""
+    try:
+        logger.log(f"  🔄 直接HTTPリクエスト（フォールバック）", "DEBUG")
+        
+        # より詳細なヘッダー
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+            'Referer': 'https://www.google.com/'
+        }
+        
+        # セッションを使用
+        session = requests.Session()
+        response = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+        
+        if response.status_code == 200:
+            logger.log(f"  ✅ 直接取得成功 (HTML: {len(response.text)} chars)", "INFO")
+            return response.text
+        else:
+            logger.log(f"  ⚠️ HTTP {response.status_code}", "WARNING")
+            return None
+            
+    except Exception as e:
+        logger.log(f"  ❌ 直接取得エラー: {str(e)}", "ERROR")
+        return None
+
 def search_with_brightdata_serp(query, serp_config, logger):
     """Bright Data SERP APIで検索"""
     try:
-        logger.log(f"  🔌 Bright Data SERP API使用", "DEBUG")
-        
         api_url = "https://api.brightdata.com/request"
         search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=ja&gl=jp"
         
@@ -135,42 +227,27 @@ def search_with_brightdata_serp(query, serp_config, logger):
             'format': 'raw'
         }
         
-        logger.log(f"  📡 検索: {query}", "DEBUG")
-        
         response = requests.post(api_url, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
             logger.log(f"  ✓ SERP API応答成功 (HTML: {len(response.text)} chars)", "DEBUG")
             return {'html': response.text, 'status': 'success'}
-        elif response.status_code == 401:
-            logger.log(f"  ❌ 認証エラー: APIキーを確認してください", "ERROR")
-            return None
-        elif response.status_code == 429:
-            logger.log(f"  ⚠️ レート制限に到達", "WARNING")
-            return None
         else:
-            logger.log(f"  ⚠️ SERP API エラー: HTTP {response.status_code}", "WARNING")
+            logger.log(f"  ⚠️ SERP API HTTP {response.status_code}", "WARNING")
             return None
             
-    except requests.exceptions.Timeout:
-        logger.log(f"  ⏱️ SERP APIタイムアウト", "WARNING")
-        return None
     except Exception as e:
         logger.log(f"  ❌ SERP APIエラー: {str(e)}", "ERROR")
         return None
 
 def extract_urls_from_html(html_content, domain, logger):
-    """HTMLからURLを抽出（強化版）"""
+    """HTMLからURLを抽出（クリーニング強化版）"""
     urls = []
     
     try:
-        # より強力な正規表現パターン
         patterns = [
-            # パターン1: href属性内のURL（最も一般的）
             rf'href=["\']?(https?://(?:www\.)?{re.escape(domain)}[^"\'\s>]*)["\']?',
-            # パターン2: 生のURL（属性外）
             rf'(https?://(?:www\.)?{re.escape(domain)}[^\s<>"\'()]*)',
-            # パターン3: JavaScriptのlocation.href
             rf'location\.href\s*=\s*["\']?(https?://(?:www\.)?{re.escape(domain)}[^"\'\s]*)["\']?',
         ]
         
@@ -178,27 +255,24 @@ def extract_urls_from_html(html_content, domain, logger):
         
         for pattern_idx, pattern in enumerate(patterns):
             matches = re.findall(pattern, html_content, re.IGNORECASE)
-            logger.log(f"    パターン{pattern_idx+1}: {len(matches)}件のマッチ", "DEBUG")
             
             for match in matches:
-                # tupleの場合は最初の要素を取得
                 url = match[0] if isinstance(match, tuple) else match
                 
-                # URLのクリーニング
-                url = url.split('?')[0]  # クエリパラメータを削除
-                url = url.rstrip('.,;:)"\'')  # 末尾の記号を削除
+                # URLクリーニング
+                url = clean_url(url)
                 
-                # 有効なURLかチェック
+                # 有効性チェック
                 if url.startswith('http') and len(url) > 20:
-                    # 除外パターン
                     exclude_patterns = ['google.com', 'youtube.com', 'facebook.com', 
-                                       'twitter.com', 'linkedin.com', '/search', '/tag/']
+                                       'twitter.com', 'linkedin.com', '/search', '/tag/', 
+                                       'translate.google', 'webcache.googleusercontent']
                     if not any(ex in url.lower() for ex in exclude_patterns):
                         all_urls.add(url)
         
         logger.log(f"    合計 {len(all_urls)} 件のユニークURL発見", "DEBUG")
         
-        # URL品質スコアリング（製品ページっぽいURLを優先）
+        # URL品質スコアリング
         scored_urls = []
         for url in all_urls:
             score = 0
@@ -227,15 +301,12 @@ def extract_urls_from_html(html_content, domain, logger):
                 'snippet': '',
                 'score': score
             })
-            logger.log(f"    ✓ URL発見 (スコア:{score}): {url[:80]}...", "DEBUG")
+            logger.log(f"    ✓ URL: {url[:80]}... (スコア:{score})", "DEBUG")
         
         if urls:
             logger.log(f"  ✅ {len(urls)}件のURL抽出成功", "INFO")
         else:
             logger.log(f"  ⚠️ 該当URLなし", "WARNING")
-            # デバッグ: HTMLの一部を出力
-            sample = html_content[:1000].replace('\n', ' ')
-            logger.log(f"  HTML Sample: {sample[:200]}...", "DEBUG")
         
         return urls
         
@@ -244,7 +315,7 @@ def extract_urls_from_html(html_content, domain, logger):
         return []
 
 def search_with_strategy(product_name, site_info, serp_config, logger):
-    """SERP APIを使用した検索戦略（最適化版）"""
+    """SERP APIを使用した検索戦略"""
     site_name = site_info["name"]
     domain = site_info["domain"]
     
@@ -254,7 +325,6 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
         logger.log(f"  ❌ SERP API未設定", "ERROR")
         return []
     
-    # 検索クエリの最適化（英語と日本語、具体的なキーワード）
     search_queries = [
         f"{product_name} site:{domain}",
         f"{product_name} price site:{domain}",
@@ -271,7 +341,6 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
         serp_data = search_with_brightdata_serp(query, serp_config, logger)
         
         if not serp_data:
-            logger.log(f"  ⚠️ SERP API応答なし、次のパターンへ", "DEBUG")
             time.sleep(1)
             continue
         
@@ -299,39 +368,13 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
     
     return all_results
 
-def fetch_page_content(url, logger):
-    """ページコンテンツを取得"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-        }
-        
-        logger.log(f"  📥 ページ取得: {url[:80]}...", "DEBUG")
-        response = requests.get(url, headers=headers, timeout=15)
-        
-        if response.status_code == 200:
-            logger.log(f"  ✓ ページ取得成功 (HTML: {len(response.text)} chars)", "DEBUG")
-            return response.text
-        else:
-            logger.log(f"  ⚠️ HTTP {response.status_code}: ページ取得失敗", "WARNING")
-            return None
-    except Exception as e:
-        logger.log(f"  ❌ ページ取得エラー: {str(e)}", "ERROR")
-        return None
-
 def extract_product_info_from_page(html_content, product_name, url, model, logger):
-    """ページHTMLから製品情報を抽出（強化版）"""
+    """ページHTMLから製品情報を抽出"""
     logger.log(f"  🤖 Gemini AIで製品情報を抽出中...", "DEBUG")
     
     try:
-        # HTMLを適切なサイズに切り詰め
-        html_content = html_content[:80000]
+        html_content = html_content[:100000]
         
-        # 改善されたプロンプト
         prompt = f"""
 あなたは化学試薬の製品情報抽出の専門家です。以下のHTMLから「{product_name}」の製品情報を正確に抽出してください。
 
@@ -350,11 +393,17 @@ def extract_product_info_from_page(html_content, product_name, url, model, logge
 3. 価格の抽出規則:
    - 「¥34,000」→ 34000
    - 「34,000円」→ 34000
-   - 「34000円」→ 34000
+   - 「$340.00」→ 340
+   - 「€250.00」→ 250
    - 「税抜 ¥32,000」→ 32000
    - 価格がない場合は offers を空配列 [] にする
 
-4. 出力形式: 必ずJSON形式で出力してください。
+4. 在庫情報:
+   - 「在庫あり」「In Stock」「Available」→ true
+   - 「在庫なし」「Out of Stock」「品切れ」→ false
+   - 不明な場合は true
+
+5. 出力形式: 必ずJSON形式で出力してください。
 
 【出力例】
 {{
@@ -377,7 +426,6 @@ def extract_product_info_from_page(html_content, product_name, url, model, logge
 必ずJSON形式のみを返してください。説明文は不要です。
 """
         
-        logger.log(f"  📤 Gemini APIリクエスト送信...", "DEBUG")
         response = model.generate_content(prompt)
         response_text = response.text.strip()
         
@@ -397,16 +445,13 @@ def extract_product_info_from_page(html_content, product_name, url, model, logge
             valid_offers = []
             for offer in product_info['offers']:
                 if 'price' in offer:
-                    # 価格を数値に変換
                     try:
                         if isinstance(offer['price'], str):
-                            # カンマ、通貨記号を削除して数値化
-                            price_str = offer['price'].replace(',', '').replace('¥', '').replace('円', '').replace('$', '').strip()
+                            price_str = offer['price'].replace(',', '').replace('¥', '').replace('円', '').replace('$', '').replace('€', '').strip()
                             offer['price'] = float(price_str)
                         else:
                             offer['price'] = float(offer['price'])
                         
-                        # 有効な価格のみ追加
                         if offer['price'] > 0:
                             valid_offers.append(offer)
                     except:
@@ -432,7 +477,7 @@ def extract_product_info_from_page(html_content, product_name, url, model, logge
         return None
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 - Ultimate）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（403/404対策版）</h1>', unsafe_allow_html=True)
     
     serp_config = check_serp_api_config()
     
@@ -443,7 +488,7 @@ def main():
         )
     else:
         st.markdown(
-            '<div class="api-status api-warning">⚠️ SERP API未設定: secrets.tomlにBRIGHTDATA_API_KEYを追加してください</div>',
+            '<div class="api-status api-warning">⚠️ SERP API未設定</div>',
             unsafe_allow_html=True
         )
     
@@ -482,6 +527,7 @@ def main():
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
         logger.log(f"🔌 SERP API: BRIGHTDATA (Zone: {serp_config['zone_name']})", "INFO")
         logger.log(f"🎯 対象サイト数: {max_sites}サイト", "INFO")
+        logger.log(f"🛡️ 403/404対策: Bright Data経由ページ取得 + 直接HTTPフォールバック", "INFO")
         
         model = setup_gemini()
         if not model:
@@ -505,10 +551,19 @@ def main():
             search_results.sort(key=lambda x: x.get('score', 0), reverse=True)
             result = search_results[0]
             
-            logger.log(f"🎯 トップURLを分析: {result['url'][:80]}...", "INFO")
+            logger.log(f"🎯 トップURL: {result['url'][:80]}...", "INFO")
             
-            # ページ取得と分析
-            html_content = fetch_page_content(result['url'], logger)
+            # ページ取得戦略: 1. Bright Data経由 → 2. 直接HTTP
+            html_content = None
+            
+            # 戦略1: Bright Data経由で取得
+            html_content = fetch_page_with_brightdata(result['url'], serp_config, logger)
+            
+            # 戦略2: 失敗した場合は直接HTTPリクエスト
+            if not html_content:
+                logger.log(f"  🔄 フォールバック: 直接HTTPリクエスト", "INFO")
+                html_content = fetch_page_direct(result['url'], logger)
+            
             if html_content:
                 page_info = extract_product_info_from_page(html_content, product_name, result['url'], model, logger)
                 
@@ -520,7 +575,7 @@ def main():
                 else:
                     logger.log(f"⚠️ {result['site']}: AI解析失敗", "WARNING")
             else:
-                logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
+                logger.log(f"❌ {result['site']}: ページ取得失敗（全戦略失敗）", "ERROR")
             
             time.sleep(2)
         
@@ -556,7 +611,6 @@ def main():
                     row = base_info.copy()
                     row['容量'] = offer.get('size', 'N/A')
                     
-                    # 価格フォーマット
                     try:
                         price = offer.get('price', 0)
                         if isinstance(price, (int, float)) and price > 0:
@@ -569,7 +623,6 @@ def main():
                     row['在庫有無'] = '有' if offer.get('inStock') else '無'
                     table_data.append(row)
             else:
-                # 価格情報がない場合も1行として表示
                 row = base_info.copy()
                 row['容量'] = 'N/A'
                 row['価格'] = 'N/A'
