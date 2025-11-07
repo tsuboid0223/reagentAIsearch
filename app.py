@@ -145,7 +145,11 @@ def clean_url(url):
 def fetch_page_with_brightdata(url, serp_config, logger):
     """Bright Data経由でページを取得（403/404対策）"""
     try:
+        # URLクリーニング（重要！）
+        clean_url_str = clean_url(url)
         logger.log(f"  🌐 Bright Data経由でページ取得", "DEBUG")
+        logger.log(f"    元URL: {url[:80]}...", "DEBUG")
+        logger.log(f"    クリーンURL: {clean_url_str[:80]}...", "DEBUG")
         
         api_url = "https://api.brightdata.com/request"
         
@@ -156,19 +160,26 @@ def fetch_page_with_brightdata(url, serp_config, logger):
         
         payload = {
             'zone': serp_config['zone_name'],
-            'url': url,
+            'url': clean_url_str,  # クリーンなURLを使用
             'format': 'raw'
         }
-        
-        logger.log(f"    リクエストURL: {url[:100]}...", "DEBUG")
         
         response = requests.post(api_url, headers=headers, json=payload, timeout=45)
         
         if response.status_code == 200:
-            logger.log(f"  ✅ ページ取得成功 (HTML: {len(response.text)} chars)", "INFO")
+            html_size = len(response.text)
+            logger.log(f"  ✅ Bright Data応答 (HTML: {html_size} chars)", "INFO")
+            
+            # HTMLサイズチェック（異常に小さい場合は警告）
+            if html_size < 1000:
+                logger.log(f"  ⚠️ HTMLサイズが異常に小さい ({html_size} chars)", "WARNING")
+                logger.log(f"  レスポンス内容: {response.text[:200]}", "DEBUG")
+                return None  # 直接HTTPにフォールバック
+            
             return response.text
         else:
             logger.log(f"  ⚠️ Bright Data HTTP {response.status_code}", "WARNING")
+            logger.log(f"  レスポンス: {response.text[:200]}", "DEBUG")
             return None
             
     except Exception as e:
@@ -178,7 +189,10 @@ def fetch_page_with_brightdata(url, serp_config, logger):
 def fetch_page_direct(url, logger):
     """直接HTTPリクエストでページ取得（フォールバック）"""
     try:
+        # URLクリーニング
+        clean_url_str = clean_url(url)
         logger.log(f"  🔄 直接HTTPリクエスト（フォールバック）", "DEBUG")
+        logger.log(f"    URL: {clean_url_str[:80]}...", "DEBUG")
         
         # より詳細なヘッダー
         headers = {
@@ -197,10 +211,18 @@ def fetch_page_direct(url, logger):
         
         # セッションを使用
         session = requests.Session()
-        response = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+        response = session.get(clean_url_str, headers=headers, timeout=15, allow_redirects=True)
         
         if response.status_code == 200:
-            logger.log(f"  ✅ 直接取得成功 (HTML: {len(response.text)} chars)", "INFO")
+            html_size = len(response.text)
+            logger.log(f"  ✅ 直接取得成功 (HTML: {html_size} chars)", "INFO")
+            
+            # HTMLサイズチェック
+            if html_size < 1000:
+                logger.log(f"  ⚠️ HTMLサイズが異常に小さい ({html_size} chars)", "WARNING")
+                logger.log(f"  レスポンス: {response.text[:200]}", "DEBUG")
+                return None
+            
             return response.text
         else:
             logger.log(f"  ⚠️ HTTP {response.status_code}", "WARNING")
