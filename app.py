@@ -11,7 +11,7 @@ from datetime import datetime
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬 価格比較システム（SERP API版）",
+    page_title="化学試薬 価格比較システム（SERP API版 - Ultimate）",
     page_icon="🧪",
     layout="wide"
 )
@@ -25,31 +25,6 @@ st.markdown("""
         color: #1f77b4;
         text-align: center;
         margin-bottom: 2rem;
-    }
-    .product-card {
-        background-color: #f8f9fa;
-        border: 1px solid #dee2e6;
-        border-radius: 0.5rem;
-        padding: 1.5rem;
-        margin: 1rem 0;
-    }
-    .product-title {
-        font-size: 1.3rem;
-        font-weight: bold;
-        color: #2c3e50;
-        margin-bottom: 0.5rem;
-    }
-    .product-info {
-        font-size: 1rem;
-        color: #495057;
-        margin: 0.3rem 0;
-    }
-    .price-row {
-        background-color: white;
-        padding: 0.8rem;
-        margin: 0.3rem 0;
-        border-radius: 0.3rem;
-        border-left: 4px solid #007bff;
     }
     .log-container {
         background-color: #f8f9fa;
@@ -93,7 +68,7 @@ class RealTimeLogger:
         self.logs.append(log_entry)
         
         with self.container:
-            st.code("\n".join(self.logs[-30:]), language="log")
+            st.code("\n".join(self.logs[-50:]), language="log")
 
 # Gemini API設定
 def setup_gemini():
@@ -145,7 +120,6 @@ def search_with_brightdata_serp(query, serp_config, logger):
     """Bright Data SERP APIで検索"""
     try:
         logger.log(f"  🔌 Bright Data SERP API使用", "DEBUG")
-        logger.log(f"  🔑 APIキー認証を使用", "DEBUG")
         
         api_url = "https://api.brightdata.com/request"
         search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=ja&gl=jp"
@@ -161,12 +135,12 @@ def search_with_brightdata_serp(query, serp_config, logger):
             'format': 'raw'
         }
         
-        logger.log(f"  📡 検索URL: {search_url[:80]}...", "DEBUG")
+        logger.log(f"  📡 検索: {query}", "DEBUG")
         
         response = requests.post(api_url, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
-            logger.log(f"  ✓ SERP API応答成功", "DEBUG")
+            logger.log(f"  ✓ SERP API応答成功 (HTML: {len(response.text)} chars)", "DEBUG")
             return {'html': response.text, 'status': 'success'}
         elif response.status_code == 401:
             logger.log(f"  ❌ 認証エラー: APIキーを確認してください", "ERROR")
@@ -176,7 +150,6 @@ def search_with_brightdata_serp(query, serp_config, logger):
             return None
         else:
             logger.log(f"  ⚠️ SERP API エラー: HTTP {response.status_code}", "WARNING")
-            logger.log(f"  レスポンス: {response.text[:200]}", "DEBUG")
             return None
             
     except requests.exceptions.Timeout:
@@ -187,72 +160,119 @@ def search_with_brightdata_serp(query, serp_config, logger):
         return None
 
 def extract_urls_from_html(html_content, domain, logger):
-    """HTMLからURLを抽出"""
+    """HTMLからURLを抽出（強化版）"""
     urls = []
     
     try:
+        # より強力な正規表現パターン
         patterns = [
-            rf'https?://(?:www\.)?{re.escape(domain)}[^\s<>"\']*',
-            rf'href="(https?://(?:www\.)?{re.escape(domain)}[^"]*)"',
-            rf"href='(https?://(?:www\.)?{re.escape(domain)}[^']*)'",
+            # パターン1: href属性内のURL（最も一般的）
+            rf'href=["\']?(https?://(?:www\.)?{re.escape(domain)}[^"\'\s>]*)["\']?',
+            # パターン2: 生のURL（属性外）
+            rf'(https?://(?:www\.)?{re.escape(domain)}[^\s<>"\'()]*)',
+            # パターン3: JavaScriptのlocation.href
+            rf'location\.href\s*=\s*["\']?(https?://(?:www\.)?{re.escape(domain)}[^"\'\s]*)["\']?',
         ]
         
         all_urls = set()
-        for pattern in patterns:
-            matches = re.findall(pattern, html_content, re.IGNORECASE)
-            for match in matches:
-                url = match[0] if isinstance(match, tuple) else match
-                if url.startswith('http') and len(url) > 20:
-                    all_urls.add(url)
         
-        for url in list(all_urls)[:10]:
-            if any(x in url.lower() for x in ['google.com', 'youtube.com', 'facebook.com']):
-                continue
+        for pattern_idx, pattern in enumerate(patterns):
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            logger.log(f"    パターン{pattern_idx+1}: {len(matches)}件のマッチ", "DEBUG")
+            
+            for match in matches:
+                # tupleの場合は最初の要素を取得
+                url = match[0] if isinstance(match, tuple) else match
                 
+                # URLのクリーニング
+                url = url.split('?')[0]  # クエリパラメータを削除
+                url = url.rstrip('.,;:)"\'')  # 末尾の記号を削除
+                
+                # 有効なURLかチェック
+                if url.startswith('http') and len(url) > 20:
+                    # 除外パターン
+                    exclude_patterns = ['google.com', 'youtube.com', 'facebook.com', 
+                                       'twitter.com', 'linkedin.com', '/search', '/tag/']
+                    if not any(ex in url.lower() for ex in exclude_patterns):
+                        all_urls.add(url)
+        
+        logger.log(f"    合計 {len(all_urls)} 件のユニークURL発見", "DEBUG")
+        
+        # URL品質スコアリング（製品ページっぽいURLを優先）
+        scored_urls = []
+        for url in all_urls:
+            score = 0
+            url_lower = url.lower()
+            
+            # 製品ページのキーワード
+            if any(kw in url_lower for kw in ['product', 'item', 'goods', 'detail', 'catalog', 'contents']):
+                score += 10
+            # 数字を含む（製品コード）
+            if re.search(r'\d{3,}', url):
+                score += 5
+            # 短すぎるURLは減点
+            if len(url) < 40:
+                score -= 5
+            
+            scored_urls.append((url, score))
+        
+        # スコアでソート
+        scored_urls.sort(key=lambda x: x[1], reverse=True)
+        
+        # 上位10件を返す
+        for url, score in scored_urls[:10]:
             urls.append({
                 'url': url,
                 'title': '',
-                'snippet': ''
+                'snippet': '',
+                'score': score
             })
+            logger.log(f"    ✓ URL発見 (スコア:{score}): {url[:80]}...", "DEBUG")
         
         if urls:
-            logger.log(f"  ✓ HTMLから{len(urls)}件のURL抽出", "INFO")
+            logger.log(f"  ✅ {len(urls)}件のURL抽出成功", "INFO")
         else:
-            logger.log(f"  ℹ️ 該当URLなし", "DEBUG")
+            logger.log(f"  ⚠️ 該当URLなし", "WARNING")
+            # デバッグ: HTMLの一部を出力
+            sample = html_content[:1000].replace('\n', ' ')
+            logger.log(f"  HTML Sample: {sample[:200]}...", "DEBUG")
         
         return urls
         
     except Exception as e:
-        logger.log(f"  URL抽出エラー: {str(e)}", "WARNING")
+        logger.log(f"  ❌ URL抽出エラー: {str(e)}", "ERROR")
         return []
 
 def search_with_strategy(product_name, site_info, serp_config, logger):
-    """SERP APIを使用した検索戦略"""
+    """SERP APIを使用した検索戦略（最適化版）"""
     site_name = site_info["name"]
     domain = site_info["domain"]
     
-    logger.log(f"🔍 {site_name}を検索中", "INFO")
+    logger.log(f"🔍 {site_name} ({domain})を検索中", "INFO")
     
     if not serp_config['available']:
         logger.log(f"  ❌ SERP API未設定", "ERROR")
         return []
     
+    # 検索クエリの最適化（英語と日本語、具体的なキーワード）
     search_queries = [
-        f"{product_name} 価格 site:{domain}",
         f"{product_name} site:{domain}",
+        f"{product_name} price site:{domain}",
+        f"{product_name} 価格 site:{domain}",
+        f"{product_name} product site:{domain}",
         f"{product_name} カタログ site:{domain}",
     ]
     
     all_results = []
     
     for query_idx, query in enumerate(search_queries):
-        logger.log(f"  検索パターン{query_idx+1}: {query[:60]}...", "DEBUG")
+        logger.log(f"  🔎 検索クエリ{query_idx+1}/5: {query}", "DEBUG")
         
         serp_data = search_with_brightdata_serp(query, serp_config, logger)
         
         if not serp_data:
             logger.log(f"  ⚠️ SERP API応答なし、次のパターンへ", "DEBUG")
-            time.sleep(2)
+            time.sleep(1)
             continue
         
         urls = extract_urls_from_html(serp_data['html'], domain, logger)
@@ -264,18 +284,18 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
                     'site': site_name,
                     'title': url_data.get('title', ''),
                     'snippet': url_data.get('snippet', ''),
-                    'html': serp_data['html']
+                    'score': url_data.get('score', 0)
                 })
             
             logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
             break
         
-        time.sleep(2)
+        time.sleep(1)
     
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
     else:
-        logger.log(f"⚠️ {site_name}: URL未発見", "WARNING")
+        logger.log(f"❌ {site_name}: URL未発見", "ERROR")
     
     return all_results
 
@@ -285,147 +305,134 @@ def fetch_page_content(url, logger):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8',
+            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
         }
         
-        response = requests.get(url, headers=headers, timeout=10)
+        logger.log(f"  📥 ページ取得: {url[:80]}...", "DEBUG")
+        response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code == 200:
-            logger.log(f"  ✓ ページ取得成功", "DEBUG")
+            logger.log(f"  ✓ ページ取得成功 (HTML: {len(response.text)} chars)", "DEBUG")
             return response.text
         else:
-            logger.log(f"  ⚠️ ページ取得失敗: HTTP {response.status_code}", "DEBUG")
+            logger.log(f"  ⚠️ HTTP {response.status_code}: ページ取得失敗", "WARNING")
             return None
     except Exception as e:
-        logger.log(f"  ページ取得エラー: {str(e)}", "DEBUG")
+        logger.log(f"  ❌ ページ取得エラー: {str(e)}", "ERROR")
         return None
 
-def extract_product_info_from_page(html_content, product_name, model, logger):
-    """ページHTMLから製品情報を抽出"""
-    logger.log(f"  🤖 ページ内容をAI分析中", "DEBUG")
+def extract_product_info_from_page(html_content, product_name, url, model, logger):
+    """ページHTMLから製品情報を抽出（強化版）"""
+    logger.log(f"  🤖 Gemini AIで製品情報を抽出中...", "DEBUG")
     
     try:
-        html_content = html_content[:50000]
+        # HTMLを適切なサイズに切り詰め
+        html_content = html_content[:80000]
         
+        # 改善されたプロンプト
         prompt = f"""
-以下のHTMLから化学試薬「{product_name}」の製品情報を抽出してください。
+あなたは化学試薬の製品情報抽出の専門家です。以下のHTMLから「{product_name}」の製品情報を正確に抽出してください。
 
-【抽出情報】
-1. productName: 製品名（文字列）
-2. modelNumber: 型番（文字列）
-3. manufacturer: メーカー名（文字列）
-4. offers: 価格情報の配列
-   各要素:
-   - size: 容量・サイズ（文字列）
-   - price: 価格（数値型、カンマなし）
-   - inStock: 在庫状況（真偽値）
+【重要な指示】
+1. HTMLから以下の情報を抽出:
+   - productName: 製品名（文字列）
+   - modelNumber: 型番、CAS番号、製品コード（文字列）
+   - manufacturer: メーカー名（文字列）
+   - offers: 価格情報の配列
 
-【重要】
-- priceは必ず数値型（整数または小数）で返す
-- 価格がない場合はoffersを空配列[]にする
-- 文字列は引用符で囲む
+2. offers配列の各要素:
+   - size: 容量・サイズ（例: "1mg", "5mg", "10mL"）
+   - price: 価格（必ず数値型、カンマなし整数または小数）
+   - inStock: 在庫状況（真偽値: true/false）
 
-JSON形式で出力:
+3. 価格の抽出規則:
+   - 「¥34,000」→ 34000
+   - 「34,000円」→ 34000
+   - 「34000円」→ 34000
+   - 「税抜 ¥32,000」→ 32000
+   - 価格がない場合は offers を空配列 [] にする
+
+4. 出力形式: 必ずJSON形式で出力してください。
+
+【出力例】
 {{
-  "productName": "製品名",
-  "modelNumber": "型番",
-  "manufacturer": "メーカー",
+  "productName": "Y-27632 dihydrochloride",
+  "modelNumber": "146986-50-7",
+  "manufacturer": "Sigma-Aldrich",
   "offers": [
-    {{"size": "10mg", "price": 12000, "inStock": true}}
+    {{"size": "1mg", "price": 34000, "inStock": true}},
+    {{"size": "5mg", "price": 54000, "inStock": true}},
+    {{"size": "25mg", "price": 164000, "inStock": false}}
   ]
 }}
 
-HTMLコンテンツ:
+【HTMLコンテンツ】
 {html_content}
+
+【ソースURL】
+{url}
+
+必ずJSON形式のみを返してください。説明文は不要です。
 """
         
+        logger.log(f"  📤 Gemini APIリクエスト送信...", "DEBUG")
         response = model.generate_content(prompt)
         response_text = response.text.strip()
         
+        logger.log(f"  📨 Gemini API応答受信 ({len(response_text)} chars)", "DEBUG")
+        
+        # JSONブロックのクリーニング
         response_text = re.sub(r'^```json\s*', '', response_text)
         response_text = re.sub(r'^```\s*', '', response_text)
         response_text = re.sub(r'\s*```$', '', response_text)
         response_text = response_text.strip()
         
+        # JSONパース
         product_info = json.loads(response_text)
         
         # データ型の検証と修正
         if 'offers' in product_info and isinstance(product_info['offers'], list):
+            valid_offers = []
             for offer in product_info['offers']:
                 if 'price' in offer:
                     # 価格を数値に変換
                     try:
                         if isinstance(offer['price'], str):
-                            # カンマを削除して数値化
-                            offer['price'] = float(offer['price'].replace(',', '').replace('¥', '').replace('円', '').strip())
+                            # カンマ、通貨記号を削除して数値化
+                            price_str = offer['price'].replace(',', '').replace('¥', '').replace('円', '').replace('$', '').strip()
+                            offer['price'] = float(price_str)
                         else:
                             offer['price'] = float(offer['price'])
+                        
+                        # 有効な価格のみ追加
+                        if offer['price'] > 0:
+                            valid_offers.append(offer)
                     except:
-                        offer['price'] = 0
+                        logger.log(f"    ⚠️ 価格変換エラー: {offer.get('price')}", "DEBUG")
+            
+            product_info['offers'] = valid_offers
         
         if product_info.get('offers'):
-            logger.log(f"  ✅ ページから{len(product_info['offers'])}件の価格抽出", "INFO")
+            logger.log(f"  ✅ {len(product_info['offers'])}件の価格情報を抽出", "INFO")
+            for i, offer in enumerate(product_info['offers'][:3]):
+                logger.log(f"    - {offer.get('size', 'N/A')}: ¥{int(offer.get('price', 0)):,}", "DEBUG")
         else:
-            logger.log(f"  ℹ️ ページに価格情報なし", "DEBUG")
+            logger.log(f"  ⚠️ 価格情報が見つかりませんでした", "WARNING")
         
         return product_info
         
+    except json.JSONDecodeError as e:
+        logger.log(f"  ❌ JSON解析エラー: {str(e)}", "ERROR")
+        logger.log(f"  レスポンス: {response_text[:300]}...", "DEBUG")
+        return None
     except Exception as e:
-        logger.log(f"  ページ解析エラー: {str(e)}", "DEBUG")
+        logger.log(f"  ❌ 製品情報抽出エラー: {str(e)}", "ERROR")
         return None
 
-def display_product_card(product, idx):
-    """製品情報を表示"""
-    st.markdown(f'<div class="product-card">', unsafe_allow_html=True)
-    
-    product_name = product.get('productName', '製品名不明')
-    site_name = product.get('source_site', '不明')
-    st.markdown(f'<div class="product-title">📦 {product_name}</div>', unsafe_allow_html=True)
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.markdown(f'<div class="product-info"><strong>販売元:</strong> {site_name}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="product-info"><strong>型番:</strong> {product.get("modelNumber", "N/A")}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="product-info"><strong>メーカー:</strong> {product.get("manufacturer", "N/A")}</div>', unsafe_allow_html=True)
-    
-    with col2:
-        source_url = product.get('source_url', '#')
-        st.markdown(f'<div class="product-info"><strong>URL:</strong> <a href="{source_url}" target="_blank">製品ページを開く</a></div>', unsafe_allow_html=True)
-    
-    if 'offers' in product and product['offers']:
-        st.markdown("**💰 価格情報:**")
-        
-        for offer in product['offers']:
-            size = offer.get('size', 'N/A')
-            price = offer.get('price', 0)
-            
-            # 価格フォーマット修正
-            try:
-                if isinstance(price, (int, float)) and price > 0:
-                    price_str = f"¥{int(price):,}"
-                else:
-                    price_str = 'N/A'
-            except:
-                price_str = 'N/A'
-            
-            stock = offer.get('inStock', False)
-            stock_icon = "✅" if stock else "❌"
-            stock_text = "在庫あり" if stock else "在庫なし"
-            
-            st.markdown(
-                f'<div class="price-row">'
-                f'<strong>{size}</strong>: {price_str} {stock_icon} {stock_text}'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-    else:
-        st.warning("⚠️ 価格情報が取得できませんでした")
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 Final）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 - Ultimate）</h1>', unsafe_allow_html=True)
     
     serp_config = check_serp_api_config()
     
@@ -439,15 +446,6 @@ def main():
             '<div class="api-status api-warning">⚠️ SERP API未設定: secrets.tomlにBRIGHTDATA_API_KEYを追加してください</div>',
             unsafe_allow_html=True
         )
-        st.info("""
-        **SERP API設定方法:**
-        
-        `.streamlit/secrets.toml`に以下を追加:
-        ```toml
-        BRIGHTDATA_API_KEY = "your_api_key"
-        BRIGHTDATA_ZONE_NAME = "serp_api1"
-        ```
-        """)
     
     col1, col2 = st.columns([3, 1])
     
@@ -463,7 +461,7 @@ def main():
             "最大検索サイト数",
             min_value=1,
             max_value=11,
-            value=3,
+            value=11,
             step=1
         )
     
@@ -483,6 +481,7 @@ def main():
         start_time = time.time()
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
         logger.log(f"🔌 SERP API: BRIGHTDATA (Zone: {serp_config['zone_name']})", "INFO")
+        logger.log(f"🎯 対象サイト数: {max_sites}サイト", "INFO")
         
         model = setup_gemini()
         if not model:
@@ -492,40 +491,49 @@ def main():
         all_products = []
         sites_to_search = dict(list(TARGET_SITES.items())[:max_sites])
         
-        for site_key, site_info in sites_to_search.items():
+        for site_idx, (site_key, site_info) in enumerate(sites_to_search.items(), 1):
+            logger.log(f"\n--- サイト {site_idx}/{max_sites} ---", "INFO")
+            
             search_results = search_with_strategy(product_name, site_info, serp_config, logger)
             
             if not search_results:
+                logger.log(f"⏭️  次のサイトへ", "DEBUG")
                 time.sleep(2)
                 continue
             
-            # 最初のURLを使用
+            # 最もスコアが高いURLを使用
+            search_results.sort(key=lambda x: x.get('score', 0), reverse=True)
             result = search_results[0]
             
-            # ページ分析のみ（スニペットは現在空なのでスキップ）
-            page_info = None
+            logger.log(f"🎯 トップURLを分析: {result['url'][:80]}...", "INFO")
+            
+            # ページ取得と分析
             html_content = fetch_page_content(result['url'], logger)
             if html_content:
-                page_info = extract_product_info_from_page(html_content, product_name, model, logger)
-            
-            if page_info:
-                page_info['source_site'] = result['site']
-                page_info['source_url'] = result['url']
-                all_products.append(page_info)
-                logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
+                page_info = extract_product_info_from_page(html_content, product_name, result['url'], model, logger)
+                
+                if page_info:
+                    page_info['source_site'] = result['site']
+                    page_info['source_url'] = result['url']
+                    all_products.append(page_info)
+                    logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
+                else:
+                    logger.log(f"⚠️ {result['site']}: AI解析失敗", "WARNING")
             else:
-                logger.log(f"⚠️ {result['site']}: 製品情報取得失敗", "WARNING")
+                logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
             
-            time.sleep(3)
+            time.sleep(2)
         
         elapsed_time = time.time() - start_time
-        logger.log(f"🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
+        logger.log(f"\n🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
+        logger.log(f"📊 取得成功: {len(all_products)}/{max_sites}サイト", "INFO")
         
         st.markdown("---")
         st.markdown("## 📋 検索結果")
         
         if not all_products:
-            st.warning("⚠️ 製品情報を抽出できませんでした")
+            st.error("❌ 製品情報を抽出できませんでした")
+            st.info("💡 ヒント: 製品名を変更するか、検索対象サイトを調整してください")
             return
         
         with_price = [p for p in all_products if p.get('offers')]
@@ -533,8 +541,44 @@ def main():
         
         st.success(f"✅ {len(all_products)}件の製品情報を取得（価格情報あり: {len(with_price)}件、処理時間: {elapsed_time:.1f}秒）")
         
-        for idx, product in enumerate(with_price + without_price):
-            display_product_card(product, idx)
+        # テーブル形式で表示
+        table_data = []
+        for product in all_products:
+            base_info = {
+                '製品名': product.get('productName', 'N/A'),
+                '販売元': product.get('source_site', 'N/A'),
+                '型番': product.get('modelNumber', 'N/A'),
+                'メーカー': product.get('manufacturer', 'N/A')
+            }
+            
+            if 'offers' in product and product['offers']:
+                for offer in product['offers']:
+                    row = base_info.copy()
+                    row['容量'] = offer.get('size', 'N/A')
+                    
+                    # 価格フォーマット
+                    try:
+                        price = offer.get('price', 0)
+                        if isinstance(price, (int, float)) and price > 0:
+                            row['価格'] = f"¥{int(price):,}"
+                        else:
+                            row['価格'] = 'N/A'
+                    except:
+                        row['価格'] = 'N/A'
+                    
+                    row['在庫有無'] = '有' if offer.get('inStock') else '無'
+                    table_data.append(row)
+            else:
+                # 価格情報がない場合も1行として表示
+                row = base_info.copy()
+                row['容量'] = 'N/A'
+                row['価格'] = 'N/A'
+                row['在庫有無'] = 'N/A'
+                table_data.append(row)
+        
+        if table_data:
+            df_display = pd.DataFrame(table_data)
+            st.dataframe(df_display, use_container_width=True, height=600)
         
         # CSV出力
         st.markdown("---")
@@ -555,7 +599,6 @@ def main():
                     row = base_info.copy()
                     row['サイズ'] = offer.get('size', 'N/A')
                     
-                    # 価格の安全な処理
                     try:
                         price = offer.get('price', 0)
                         row['価格'] = int(price) if isinstance(price, (int, float)) else 0
