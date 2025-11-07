@@ -194,6 +194,8 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
         status_text.text(f"Webページを取得中... ({i + 1}/{len(unique_urls)}): {url[:50]}...")
         page_result = get_page_content_with_brightdata(url, brd_username, brd_password)
         all_page_content_results.append(page_result)
+        if page_result.get('error'):
+            st.warning(f"取得失敗: {url} - スキップして次へ")
         # 進捗更新
         progress = 0.2 + (i + 1) / len(unique_urls) * 0.6
         progress_bar.progress(progress)
