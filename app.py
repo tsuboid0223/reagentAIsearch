@@ -248,10 +248,10 @@ def get_page_content_direct(url: str, rt_logger: RealTimeLogger, timeout: int = 
         return result
 
 # ==============================================================================
-# AI解析関数
+# AI解析関数（修正版 - responseMimeType削除）
 # ==============================================================================
 def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_key: str, rt_logger: RealTimeLogger, model_name: str = DEFAULT_MODEL) -> dict | None:
-    """Gemini APIで製品情報を抽出"""
+    """Gemini APIで製品情報を抽出（Gemini 2.0対応版）"""
     
     prompt = f"""
 あなたは化学試薬ECサイトの情報抽出エージェントです。
@@ -277,7 +277,9 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
 - 情報が見つからない項目はnull
 - offers配列は必ず作成（空でも可）
 
-【出力形式】
+【重要: 出力形式】
+必ず以下のJSON形式で出力してください。他のテキストは含めないでください:
+
 {{
   "productName": "string or null",
   "modelNumber": "string or null", 
@@ -293,12 +295,14 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
         rt_logger.add(f"  モデル: {model_name}", "info")
         start_time = time.time()
         
+        # Gemini 2.0用: responseMimeTypeを削除
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
-                "responseMimeType": "application/json",
                 "temperature": 0.1,
-                "maxOutputTokens": 2048
+                "maxOutputTokens": 2048,
+                "topP": 0.95,
+                "topK": 40
             }
         }
         
@@ -315,7 +319,7 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
         rt_logger.add(f"  応答受信 ({elapsed:.1f}秒) - status: {response.status_code}", "info")
         
         if response.status_code != 200:
-            rt_logger.add(f"  ❌ エラー: {response.text[:200]}", "error")
+            rt_logger.add(f"  ❌ エラー: {response.text[:300]}", "error")
             return None
         
         result = response.json()
@@ -325,18 +329,56 @@ def analyze_page_with_gemini(page_content: str, product_name: str, gemini_api_ke
             return None
         
         response_text = result['candidates'][0]['content']['parts'][0]['text']
-        rt_logger.add(f"  JSON解析中... ({len(response_text)}文字)", "info")
+        rt_logger.add(f"  レスポンステキスト受信 ({len(response_text)}文字)", "info")
         
-        data = json.loads(response_text)
+        # JSONを抽出（マークダウンコードブロックの可能性を考慮）
+        json_text = response_text
+        
+        # ```json ... ``` の形式の場合
+        if '```json' in response_text:
+            json_text = response_text.split('```json')[1].split('```')[0].strip()
+            rt_logger.add(f"  マークダウンブロックからJSON抽出", "info")
+        # ``` ... ``` の形式の場合
+        elif '```' in response_text:
+            json_text = response_text.split('```')[1].strip()
+            rt_logger.add(f"  コードブロックからJSON抽出", "info")
+        
+        rt_logger.add(f"  JSON解析中... ({len(json_text)}文字)", "info")
+        
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError as e:
+            rt_logger.add(f"  ⚠️ JSON解析失敗 - 行: {e.lineno}, 列: {e.colno}", "warning")
+            rt_logger.add(f"  エラー付近: {json_text[max(0, e.pos-50):e.pos+50]}", "warning")
+            
+            # フォールバック: { } で囲まれた部分を抽出
+            import re
+            json_match = re.search(r'\{.*\}', json_text, re.DOTALL)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group(0))
+                    rt_logger.add(f"  正規表現でJSON抽出成功", "success")
+                except:
+                    return None
+            else:
+                return None
         
         offers_count = len(data.get("offers", []))
         rt_logger.add(f"  ✅ 抽出成功: offers {offers_count}件", "success")
+        
+        if offers_count > 0:
+            # サンプル表示
+            sample_offer = data["offers"][0]
+            rt_logger.add(f"    例: {sample_offer.get('size')} - ¥{sample_offer.get('price')}", "info")
         
         return data if isinstance(data, dict) else None
         
     except Exception as e:
         rt_logger.add(f"  ❌ AI解析エラー: {str(e)[:100]}", "error")
+        import traceback
+        rt_logger.add(f"  詳細: {traceback.format_exc()[:200]}", "error")
         return None
+
 
 # ==============================================================================
 # メイン処理
