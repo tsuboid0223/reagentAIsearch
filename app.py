@@ -5,14 +5,13 @@ import time
 import re
 import json
 import pandas as pd
-from urllib.parse import quote_plus, unquote, urlparse
+from urllib.parse import quote_plus
 from io import StringIO
 from datetime import datetime
-import random
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬 価格比較システム",
+    page_title="化学試薬 価格比較システム（SERP API版）",
     page_icon="🧪",
     layout="wide"
 )
@@ -63,16 +62,24 @@ st.markdown("""
         overflow-y: auto;
         margin: 1rem 0;
     }
+    .api-status {
+        padding: 0.5rem 1rem;
+        border-radius: 0.3rem;
+        margin: 0.5rem 0;
+        font-weight: bold;
+    }
+    .api-success {
+        background-color: #d4edda;
+        color: #155724;
+        border: 1px solid #c3e6cb;
+    }
+    .api-warning {
+        background-color: #fff3cd;
+        color: #856404;
+        border: 1px solid #ffeeba;
+    }
 </style>
 """, unsafe_allow_html=True)
-
-# User-Agent リスト
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-]
 
 # リアルタイムログクラス
 class RealTimeLogger:
@@ -98,6 +105,35 @@ def setup_gemini():
         st.error(f"❌ Gemini API設定エラー: {str(e)}")
         return None
 
+# SERP API設定チェック
+def check_serp_api_config():
+    """SERP API認証情報の確認"""
+    try:
+        # APIキー認証
+        if "BRIGHTDATA_API_KEY" in st.secrets:
+            return {
+                'provider': 'brightdata',
+                'auth_type': 'api_key',
+                'api_key': st.secrets["BRIGHTDATA_API_KEY"],
+                'available': True
+            }
+        # Username/Password認証（フォールバック）
+        elif "BRIGHTDATA_USERNAME" in st.secrets and "BRIGHTDATA_PASSWORD" in st.secrets:
+            return {
+                'provider': 'brightdata',
+                'auth_type': 'basic',
+                'username': st.secrets["BRIGHTDATA_USERNAME"],
+                'password': st.secrets["BRIGHTDATA_PASSWORD"],
+                'available': True
+            }
+    except:
+        pass
+    
+    return {
+        'provider': None,
+        'available': False
+    }
+
 # 対象ECサイトの定義（11サイト）
 TARGET_SITES = {
     "cosmobio": {"name": "コスモバイオ", "domain": "cosmobio.co.jp"},
@@ -113,134 +149,141 @@ TARGET_SITES = {
     "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}
 }
 
-def clean_google_url(url):
-    """GoogleリダイレクトURLをクリーンアップ"""
+def search_with_brightdata_serp(query, serp_config, logger):
+    """Bright Data SERP APIで検索（改善版）"""
     try:
-        # /url?q= 形式の処理
-        if '/url?q=' in url or '/url?url=' in url:
-            parsed = urlparse(url)
-            from urllib.parse import parse_qs
-            params = parse_qs(parsed.query)
-            if 'q' in params:
-                url = params['q'][0]
-            elif 'url' in params:
-                url = params['url'][0]
+        logger.log(f"  🔌 Bright Data SERP API使用", "DEBUG")
         
-        # URLデコード
-        url = unquote(url)
-        
-        # 不要なパラメータを除去
-        url = url.split('&sa=')[0].split('&ved=')[0]
-        
-        return url
-    except:
-        return url
-
-def extract_urls_from_html_improved(html_content, domain):
-    """改善されたURL抽出ロジック"""
-    
-    # 複数のパターンで試行
-    patterns = [
-        # 標準的なURL
-        rf'https?://(?:www\.)?{re.escape(domain)}[^\s<>"\'\)]*',
-        # Googleリダイレクト形式
-        rf'/url\?q=https?://(?:www\.)?{re.escape(domain)}[^&\s<>"\']*',
-        rf'/url\?url=https?://(?:www\.)?{re.escape(domain)}[^&\s<>"\']*',
-        # href属性内
-        rf'href="(https?://(?:www\.)?{re.escape(domain)}[^"]*)"',
-        rf"href='(https?://(?:www\.)?{re.escape(domain)}[^']*)'",
-    ]
-    
-    all_urls = set()
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, html_content, re.IGNORECASE)
-        for match in matches:
-            # タプルの場合は最初の要素を取得
-            url = match[0] if isinstance(match, tuple) else match
+        # 認証タイプに応じてエンドポイントとパラメータを設定
+        if serp_config.get('auth_type') == 'api_key':
+            # APIキー認証
+            logger.log(f"  🔑 APIキー認証を使用", "DEBUG")
             
-            # クリーンアップ
-            url = clean_google_url(url)
+            # Bright Data SERP APIエンドポイント（正しい形式）
+            api_url = "https://api.brightdata.com/serp/google"
             
-            # 有効なURLのみ追加
-            if url.startswith('http') and len(url) > 20:
-                # 除外パターン
-                if not any(x in url.lower() for x in ['google.com', 'youtube.com', 'facebook.com', 'twitter.com']):
-                    all_urls.add(url)
-    
-    # URLの優先順位付け
-    priority_keywords = [
-        'product', 'detail', 'item', 'price', 'catalog',
-        '製品', '商品', '価格', 'カタログ', 'p_view', 'view'
-    ]
-    
-    prioritized = []
-    others = []
-    
-    for url in all_urls:
-        if any(keyword in url.lower() for keyword in priority_keywords):
-            prioritized.append(url)
-        else:
-            others.append(url)
-    
-    result = (prioritized + others)[:10]
-    
-    return result
-
-def search_with_retry(query, max_retries=3, logger=None):
-    """リトライ機能付き検索"""
-    
-    for retry in range(max_retries):
-        try:
-            search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10"
-            
+            # ヘッダーにAPIキーを設定
             headers = {
-                'User-Agent': random.choice(USER_AGENTS),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Referer': 'https://www.google.com/',
+                'Authorization': f'Bearer {serp_config["api_key"]}',
+                'Content-Type': 'application/json'
             }
             
+            # リクエストパラメータ
+            params = {
+                'q': query,
+                'num': 10,
+                'hl': 'ja',
+                'gl': 'jp',
+            }
+            
+            # APIリクエスト
             response = requests.get(
-                search_url,
+                api_url,
                 headers=headers,
-                timeout=15
+                params=params,
+                timeout=30
             )
             
-            if response.status_code == 200:
-                if logger:
-                    logger.log(f"  ✓ 検索成功（試行{retry+1}回目）", "DEBUG")
-                return response.text
-            elif response.status_code == 429:
-                if logger:
-                    logger.log(f"  レート制限検出、待機中...", "WARNING")
-                wait_time = (retry + 1) * 10
-                time.sleep(wait_time)
-            else:
-                if logger:
-                    logger.log(f"  HTTP {response.status_code}、リトライ中...", "WARNING")
-                time.sleep(random.uniform(3, 6))
-                
-        except Exception as e:
-            if logger:
-                logger.log(f"  検索エラー: {str(e)}", "WARNING")
-            if retry < max_retries - 1:
-                time.sleep(random.uniform(5, 10))
-    
-    return None
+        else:
+            # Basic認証（Username/Password）
+            logger.log(f"  🔐 Basic認証を使用", "DEBUG")
+            
+            api_url = "https://api.brightdata.com/serp/google"
+            
+            # 認証情報
+            auth = (serp_config['username'], serp_config['password'])
+            
+            # リクエストパラメータ
+            params = {
+                'q': query,
+                'num': 10,
+                'hl': 'ja',
+                'gl': 'jp',
+            }
+            
+            # APIリクエスト
+            response = requests.get(
+                api_url,
+                auth=auth,
+                params=params,
+                timeout=30
+            )
+        
+        if response.status_code == 200:
+            logger.log(f"  ✓ SERP API応答成功", "DEBUG")
+            return response.json()
+        elif response.status_code == 401:
+            logger.log(f"  ❌ 認証エラー: APIキーを確認してください", "ERROR")
+            return None
+        elif response.status_code == 429:
+            logger.log(f"  ⚠️ レート制限に到達", "WARNING")
+            return None
+        else:
+            logger.log(f"  ⚠️ SERP API エラー: HTTP {response.status_code}", "WARNING")
+            logger.log(f"  レスポンス: {response.text[:200]}", "DEBUG")
+            return None
+            
+    except requests.exceptions.Timeout:
+        logger.log(f"  ⏱️ SERP APIタイムアウト", "WARNING")
+        return None
+    except Exception as e:
+        logger.log(f"  ❌ SERP APIエラー: {str(e)}", "ERROR")
+        return None
 
-def search_with_strategy(product_name, site_info, logger):
-    """多層戦略で検索（改善版）"""
+def extract_urls_from_serp_response(serp_data, domain, logger):
+    """SERP APIレスポンスからURLを抽出"""
+    urls = []
+    
+    try:
+        # Bright Data SERP APIのレスポンス構造に対応
+        if 'organic_results' in serp_data:
+            for result in serp_data['organic_results'][:10]:
+                url = result.get('url', '')
+                
+                # ドメインチェック
+                if domain in url:
+                    urls.append({
+                        'url': url,
+                        'title': result.get('title', ''),
+                        'snippet': result.get('snippet', '')
+                    })
+        
+        # 他の一般的なSERP APIフォーマット
+        elif 'results' in serp_data:
+            for result in serp_data['results'][:10]:
+                url = result.get('link', '') or result.get('url', '')
+                
+                if domain in url:
+                    urls.append({
+                        'url': url,
+                        'title': result.get('title', ''),
+                        'snippet': result.get('snippet', '') or result.get('description', '')
+                    })
+        
+        if urls:
+            logger.log(f"  ✓ SERP APIから{len(urls)}件のURL抽出", "INFO")
+        else:
+            logger.log(f"  ℹ️ 該当URLなし", "DEBUG")
+        
+        return urls
+        
+    except Exception as e:
+        logger.log(f"  URL抽出エラー: {str(e)}", "WARNING")
+        return []
+
+def search_with_strategy(product_name, site_info, serp_config, logger):
+    """SERP APIを使用した検索戦略"""
     site_name = site_info["name"]
     domain = site_info["domain"]
     
     logger.log(f"🔍 {site_name}を検索中", "INFO")
     
-    # 検索クエリパターン
+    # SERP API利用可能性チェック
+    if not serp_config['available']:
+        logger.log(f"  ❌ SERP API未設定", "ERROR")
+        return []
+    
+    # 検索クエリパターン（優先順）
     search_queries = [
         f"{product_name} 価格 site:{domain}",
         f"{product_name} site:{domain}",
@@ -252,31 +295,32 @@ def search_with_strategy(product_name, site_info, logger):
     for query_idx, query in enumerate(search_queries):
         logger.log(f"  検索パターン{query_idx+1}: {query[:60]}...", "DEBUG")
         
-        # リトライ機能付き検索
-        search_html = search_with_retry(query, max_retries=2, logger=logger)
+        # SERP APIで検索
+        serp_data = search_with_brightdata_serp(query, serp_config, logger)
         
-        if not search_html:
+        if not serp_data:
+            logger.log(f"  ⚠️ SERP API応答なし、次のパターンへ", "DEBUG")
+            time.sleep(2)
             continue
         
-        # 改善されたURL抽出
-        urls = extract_urls_from_html_improved(search_html, domain)
+        # URLを抽出
+        urls = extract_urls_from_serp_response(serp_data, domain, logger)
         
         if urls:
-            logger.log(f"  ✓ {len(urls)}件のURL発見", "INFO")
-            
-            for url in urls[:3]:
+            for url_data in urls[:5]:
                 all_results.append({
-                    'url': url,
+                    'url': url_data['url'],
                     'site': site_name,
-                    'search_html': search_html,
-                    'query': query
+                    'title': url_data['title'],
+                    'snippet': url_data['snippet'],
+                    'serp_data': serp_data
                 })
             
-            # URLが見つかったら次のサイトへ
+            logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
             break
         
-        # レート制限対策
-        time.sleep(random.uniform(2, 4))
+        # 次のクエリまで待機
+        time.sleep(2)
     
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
@@ -285,15 +329,19 @@ def search_with_strategy(product_name, site_info, logger):
     
     return all_results
 
-def extract_price_from_search_snippet(search_html, product_name, model, logger):
-    """検索結果スニペットから価格情報を抽出"""
-    logger.log(f"  💡 スニペットから価格抽出中", "DEBUG")
+def extract_price_from_snippet(snippet, title, product_name, model, logger):
+    """スニペットとタイトルから価格情報を抽出"""
+    logger.log(f"  💡 スニペット分析中", "DEBUG")
     
     try:
-        search_html = search_html[:30000]
-        
         prompt = f"""
-以下はGoogle検索結果のHTMLです。化学試薬「{product_name}」に関する価格情報をスニペットから抽出してください。
+以下のGoogle検索結果のタイトルとスニペットから、化学試薬「{product_name}」の価格情報を抽出してください。
+
+【タイトル】
+{title}
+
+【スニペット】
+{snippet}
 
 【抽出する情報】
 1. productName: 製品名
@@ -305,15 +353,12 @@ def extract_price_from_search_snippet(search_html, product_name, model, logger):
    - inStock: 在庫状況（不明な場合はtrue）
 
 【重要】
-- スニペットやタイトルに価格情報（¥、円、$、price）が含まれている場合は必ず抽出
+- 価格情報（¥、円、$、price）が含まれている場合は必ず抽出
 - 型番と価格がセットで表示されている場合は対応付けて抽出
 - 価格情報がない場合はoffersを空配列に
 
 【出力形式】
 JSON形式のみ。マークダウン不要。
-
-検索結果HTML:
-{search_html}
 """
         
         response = model.generate_content(prompt)
@@ -342,7 +387,7 @@ def fetch_page_content(url, logger):
     """ページコンテンツを取得"""
     try:
         headers = {
-            'User-Agent': random.choice(USER_AGENTS),
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8',
         }
@@ -350,11 +395,14 @@ def fetch_page_content(url, logger):
         response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200:
+            logger.log(f"  ✓ ページ取得成功", "DEBUG")
             return response.text
-    except:
-        pass
-    
-    return None
+        else:
+            logger.log(f"  ⚠️ ページ取得失敗: HTTP {response.status_code}", "DEBUG")
+            return None
+    except Exception as e:
+        logger.log(f"  ページ取得エラー: {str(e)}", "DEBUG")
+        return None
 
 def extract_product_info_from_page(html_content, product_name, model, logger):
     """ページHTMLから製品情報を抽出"""
@@ -473,7 +521,37 @@ def display_product_card(product, idx):
     st.markdown('</div>', unsafe_allow_html=True)
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（修正版）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 v2）</h1>', unsafe_allow_html=True)
+    
+    # SERP API設定チェック
+    serp_config = check_serp_api_config()
+    
+    # API状態表示
+    if serp_config['available']:
+        auth_type_display = "APIキー" if serp_config.get('auth_type') == 'api_key' else "Basic認証"
+        st.markdown(
+            f'<div class="api-status api-success">✅ SERP API接続: {serp_config["provider"].upper()} ({auth_type_display})</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            '<div class="api-status api-warning">⚠️ SERP API未設定: secrets.tomlにBRIGHTDATA_API_KEYまたはBRIGHTDATA_USERNAME/PASSWORDを追加してください</div>',
+            unsafe_allow_html=True
+        )
+        st.info("""
+        **SERP API設定方法:**
+        
+        **オプション1: APIキー認証（推奨）**
+        ```toml
+        BRIGHTDATA_API_KEY = "your_api_key"
+        ```
+        
+        **オプション2: Username/Password認証**
+        ```toml
+        BRIGHTDATA_USERNAME = "your_username"
+        BRIGHTDATA_PASSWORD = "your_password"
+        ```
+        """)
     
     col1, col2 = st.columns([3, 1])
     
@@ -495,7 +573,10 @@ def main():
     
     st.markdown("---")
     
-    if st.button("🚀 検索開始", type="primary", use_container_width=True):
+    # 検索ボタン（SERP API未設定時は無効化）
+    search_disabled = not serp_config['available']
+    
+    if st.button("🚀 検索開始", type="primary", use_container_width=True, disabled=search_disabled):
         if not product_name:
             st.warning("⚠️ 製品名を入力してください")
             return
@@ -506,7 +587,8 @@ def main():
         
         start_time = time.time()
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
-        logger.log(f"📊 改善: URL抽出ロジック強化、リトライ機能追加", "INFO")
+        auth_type_display = "APIキー" if serp_config.get('auth_type') == 'api_key' else "Basic認証"
+        logger.log(f"🔌 SERP API: {serp_config['provider'].upper()} ({auth_type_display})", "INFO")
         
         model = setup_gemini()
         if not model:
@@ -517,17 +599,18 @@ def main():
         sites_to_search = dict(list(TARGET_SITES.items())[:max_sites])
         
         for site_key, site_info in sites_to_search.items():
-            search_results = search_with_strategy(product_name, site_info, logger)
+            search_results = search_with_strategy(product_name, site_info, serp_config, logger)
             
             if not search_results:
-                time.sleep(random.uniform(2, 4))
+                time.sleep(2)
                 continue
             
             result = search_results[0]
             
             # スニペット分析
-            snippet_info = extract_price_from_search_snippet(
-                result['search_html'],
+            snippet_info = extract_price_from_snippet(
+                result['snippet'],
+                result['title'],
                 product_name,
                 model,
                 logger
@@ -550,7 +633,7 @@ def main():
             else:
                 logger.log(f"⚠️ {result['site']}: 製品情報取得失敗", "WARNING")
             
-            time.sleep(random.uniform(3, 5))
+            time.sleep(3)
         
         elapsed_time = time.time() - start_time
         logger.log(f"🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
