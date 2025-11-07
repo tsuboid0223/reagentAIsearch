@@ -65,7 +65,7 @@ def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: 
     return result
 
 
-def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
+def search_product_urls_with_brightdata(query: str, api_key: str) -> dict:
     """Bright DataのSERP APIでGoogle検索を実行し、URLリストを取得する。"""
     st.info(f"【Bright Data】クエリ「{query}」で検索リクエストを送信...")
     headers = {
