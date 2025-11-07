@@ -5,13 +5,13 @@ import time
 import re
 import json
 import pandas as pd
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 from io import StringIO
 from datetime import datetime
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬 価格比較システム（本番版）",
+    page_title="化学試薬 価格比較システム",
     page_icon="🧪",
     layout="wide"
 )
@@ -26,35 +26,30 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .site-badge {
-        display: inline-block;
-        padding: 0.25rem 0.75rem;
-        margin: 0.25rem;
-        border-radius: 1rem;
-        background-color: #e3f2fd;
-        color: #1565c0;
-        font-size: 0.85rem;
-    }
-    .success-box {
-        padding: 1rem;
+    .product-card {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
         border-radius: 0.5rem;
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
+        padding: 1.5rem;
         margin: 1rem 0;
     }
-    .warning-box {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        background-color: #fff3cd;
-        border: 1px solid #ffeeba;
-        margin: 1rem 0;
+    .product-title {
+        font-size: 1.3rem;
+        font-weight: bold;
+        color: #2c3e50;
+        margin-bottom: 0.5rem;
     }
-    .error-box {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        background-color: #f8d7da;
-        border: 1px solid #f5c6cb;
-        margin: 1rem 0;
+    .product-info {
+        font-size: 1rem;
+        color: #495057;
+        margin: 0.3rem 0;
+    }
+    .price-row {
+        background-color: white;
+        padding: 0.8rem;
+        margin: 0.3rem 0;
+        border-radius: 0.3rem;
+        border-left: 4px solid #007bff;
     }
     .log-container {
         background-color: #f8f9fa;
@@ -65,25 +60,24 @@ st.markdown("""
         font-size: 0.85rem;
         max-height: 400px;
         overflow-y: auto;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # リアルタイムログクラス
 class RealTimeLogger:
-    def __init__(self, container, show_debug=True):
+    def __init__(self, container):
         self.container = container
         self.logs = []
-        self.show_debug = show_debug
         
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] [{level}] {message}"
         self.logs.append(log_entry)
         
-        if self.show_debug:
-            with self.container:
-                st.code("\n".join(self.logs[-20:]), language="log")  # 最新20件を表示
+        with self.container:
+            st.code("\n".join(self.logs[-30:]), language="log")
 
 # Gemini API設定
 def setup_gemini():
@@ -95,247 +89,211 @@ def setup_gemini():
         st.error(f"❌ Gemini API設定エラー: {str(e)}")
         return None
 
-# Bright Data設定
-def get_brightdata_config():
-    try:
-        return {
-            'api_key': st.secrets["BRIGHTDATA_API_KEY"],
-            'username': st.secrets["BRIGHTDATA_USERNAME"],
-            'password': st.secrets["BRIGHTDATA_PASSWORD"]
-        }
-    except Exception as e:
-        st.error(f"❌ Bright Data設定エラー: {str(e)}")
-        return None
-
 # 対象ECサイトの定義（11サイト）
 TARGET_SITES = {
-    "cosmobio": {"name": "コスモバイオ", "domain": "cosmobio.co.jp", "enabled": True},
-    "funakoshi": {"name": "フナコシ", "domain": "funakoshi.co.jp", "enabled": True},
-    "axel": {"name": "AXEL", "domain": "axel.as-1.co.jp", "enabled": True},
-    "selleck": {"name": "Selleck", "domain": "selleck.co.jp", "enabled": True},
-    "mce": {"name": "MCE", "domain": "medchemexpress.com", "enabled": True},
-    "nakarai": {"name": "ナカライ", "domain": "nacalai.co.jp", "enabled": True},
-    "fujifilm": {"name": "富士フイルム和光", "domain": "labchem-wako.fujifilm.com", "enabled": True},
-    "kanto": {"name": "関東化学", "domain": "kanto.co.jp", "enabled": True},
-    "tci": {"name": "TCI", "domain": "tcichemicals.com", "enabled": True},
-    "merck": {"name": "Merck", "domain": "merck.com", "enabled": True},
-    "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp", "enabled": True}
+    "cosmobio": {"name": "コスモバイオ", "domain": "cosmobio.co.jp"},
+    "funakoshi": {"name": "フナコシ", "domain": "funakoshi.co.jp"},
+    "axel": {"name": "AXEL", "domain": "axel.as-1.co.jp"},
+    "selleck": {"name": "Selleck", "domain": "selleck.co.jp"},
+    "mce": {"name": "MCE", "domain": "medchemexpress.com"},
+    "nakarai": {"name": "ナカライ", "domain": "nacalai.co.jp"},
+    "fujifilm": {"name": "富士フイルム和光", "domain": "labchem-wako.fujifilm.com"},
+    "kanto": {"name": "関東化学", "domain": "kanto.co.jp"},
+    "tci": {"name": "TCI", "domain": "tcichemicals.com"},
+    "merck": {"name": "Merck", "domain": "merck.com"},
+    "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}
 }
 
 # フォールバックURL（Y27632用）
 FALLBACK_URLS = {
     "Y-27632": {
-        "cosmobio": "https://www.cosmobio.co.jp/product/detail/y-27632-dihydrochloride-alx-270-333.asp",
-        "funakoshi": "https://www.funakoshi.co.jp/contents/4567",
-        "axel": "https://www.axel.as-1.co.jp/asone/d/62-3817-51/",
+        "cosmobio": "https://www.cosmobio.co.jp/product/detail/y-27632-dihydrochloride-enz.asp?entry_id=16716",
     }
 }
 
 def validate_url(url, logger):
     """URLが有効かチェック（404を除外）"""
     try:
-        logger.log(f"URL検証中: {url}", "DEBUG")
         response = requests.head(url, timeout=5, allow_redirects=True)
         if response.status_code == 404:
-            logger.log(f"404エラー: {url}", "WARNING")
+            logger.log(f"404エラー", "DEBUG")
             return False
-        logger.log(f"有効なURL: {url} (status: {response.status_code})", "DEBUG")
         return True
-    except Exception as e:
-        logger.log(f"URL検証失敗: {url} - {str(e)}", "WARNING")
+    except:
         return False
 
-def search_product_urls(product_name, sites, logger, max_urls=10):
-    """Google検索で製品URLを取得（Bright Data経由 + 直接アクセスフォールバック）"""
-    logger.log(f"製品URL検索開始: {product_name} (最大{max_urls}件)", "INFO")
+def search_with_strategy(product_name, site_info, logger):
+    """
+    多層戦略でURLと価格情報を検索
     
-    all_urls = []
-    config = get_brightdata_config()
+    戦略1: Google検索結果スニペットから価格情報を直接抽出
+    戦略2: 複数の検索クエリパターンを試行
+    戦略3: 検索結果から複数URLを取得
+    """
+    site_name = site_info["name"]
+    domain = site_info["domain"]
     
-    for site_key, site_info in sites.items():
-        if not site_info["enabled"]:
-            continue
+    logger.log(f"🔍 {site_name}を検索中", "INFO")
+    
+    # 戦略1: 検索結果スニペットから価格情報を抽出
+    search_queries = [
+        f"{product_name} 価格 site:{domain}",  # 価格重視
+        f"{product_name} カタログ 価格表 site:{domain}",  # カタログ重視
+        f"{product_name} site:{domain}",  # 標準検索
+    ]
+    
+    all_results = []
+    
+    for query_idx, query in enumerate(search_queries):
+        try:
+            search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
             
-        site_name = site_info["name"]
-        domain = site_info["domain"]
-        
-        logger.log(f"検索中: {site_name} ({domain})", "INFO")
-        
-        # フォールバックURLの確認
-        if product_name in FALLBACK_URLS and site_key in FALLBACK_URLS[product_name]:
-            fallback_url = FALLBACK_URLS[product_name][site_key]
-            if validate_url(fallback_url, logger):
-                logger.log(f"✓ フォールバックURL使用: {fallback_url}", "INFO")
-                all_urls.append({
-                    'url': fallback_url,
-                    'site': site_name,
-                    'title': f"{product_name} - {site_name}"
-                })
-                if len(all_urls) >= max_urls:
-                    return all_urls
-                continue
-        
-        # Google検索クエリ
-        query = f"{product_name} site:{domain}"
-        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=3"
-        
-        # Bright Data経由で試行（POSTメソッド）
-        urls_found = False
-        if config:
-            try:
-                logger.log(f"Bright Data POST経由でアクセス試行...", "DEBUG")
-                proxy_url = "http://brd.superproxy.io:33335"
-                proxies = {
-                    'http': f"http://{config['username']}:{config['password']}@brd.superproxy.io:33335",
-                    'https': f"http://{config['username']}:{config['password']}@brd.superproxy.io:33335"
-                }
+            logger.log(f"  検索パターン{query_idx+1}: {query[:50]}...", "DEBUG")
+            
+            response = requests.get(
+                search_url,
+                timeout=10,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            
+            if response.status_code == 200:
+                search_html = response.text
                 
-                response = requests.post(
-                    search_url,
-                    proxies=proxies,
-                    timeout=10,
-                    headers={'User-Agent': 'Mozilla/5.0'}
-                )
+                # URLを抽出
+                urls = extract_urls_from_html(search_html, domain)
                 
-                if response.status_code == 200:
-                    urls = extract_urls_from_html(response.text, domain)
-                    if urls:
-                        logger.log(f"✓ {len(urls)}件のURLを発見（Bright Data POST）", "INFO")
-                        for url in urls[:2]:  # サイトごとに最大2件
-                            if validate_url(url, logger):
-                                all_urls.append({
-                                    'url': url,
-                                    'site': site_name,
-                                    'title': f"{product_name} - {site_name}"
-                                })
-                                if len(all_urls) >= max_urls:
-                                    return all_urls
-                        urls_found = True
-            except Exception as e:
-                logger.log(f"Bright Data POST失敗: {str(e)}", "WARNING")
-        
-        # Bright Data GETメソッドで試行
-        if not urls_found and config:
-            try:
-                logger.log(f"Bright Data GET経由でアクセス試行...", "DEBUG")
-                response = requests.get(
-                    search_url,
-                    proxies=proxies,
-                    timeout=10,
-                    headers={'User-Agent': 'Mozilla/5.0'}
-                )
+                if urls:
+                    logger.log(f"  ✓ {len(urls)}件のURL発見", "DEBUG")
+                    
+                    # 各URLを結果に追加（検索結果HTMLも保存）
+                    for url in urls[:3]:  # 各クエリで最大3件
+                        all_results.append({
+                            'url': url,
+                            'site': site_name,
+                            'search_html': search_html,  # 価格抽出用
+                            'query': query
+                        })
                 
-                if response.status_code == 200:
-                    urls = extract_urls_from_html(response.text, domain)
-                    if urls:
-                        logger.log(f"✓ {len(urls)}件のURLを発見（Bright Data GET）", "INFO")
-                        for url in urls[:2]:
-                            if validate_url(url, logger):
-                                all_urls.append({
-                                    'url': url,
-                                    'site': site_name,
-                                    'title': f"{product_name} - {site_name}"
-                                })
-                                if len(all_urls) >= max_urls:
-                                    return all_urls
-                        urls_found = True
-            except Exception as e:
-                logger.log(f"Bright Data GET失敗: {str(e)}", "WARNING")
+                # 1つのクエリで結果が見つかったら次のサイトへ
+                if urls:
+                    break
+                    
+        except Exception as e:
+            logger.log(f"  検索エラー: {str(e)}", "WARNING")
         
-        # 直接アクセス（フォールバック）
-        if not urls_found:
-            try:
-                logger.log(f"直接アクセス試行...", "DEBUG")
-                response = requests.get(
-                    search_url,
-                    timeout=10,
-                    headers={'User-Agent': 'Mozilla/5.0'}
-                )
-                
-                if response.status_code == 200:
-                    urls = extract_urls_from_html(response.text, domain)
-                    if urls:
-                        logger.log(f"✓ {len(urls)}件のURLを発見（直接アクセス）", "INFO")
-                        for url in urls[:2]:
-                            if validate_url(url, logger):
-                                all_urls.append({
-                                    'url': url,
-                                    'site': site_name,
-                                    'title': f"{product_name} - {site_name}"
-                                })
-                                if len(all_urls) >= max_urls:
-                                    return all_urls
-            except Exception as e:
-                logger.log(f"直接アクセス失敗: {str(e)}", "WARNING")
-        
-        time.sleep(2)  # レート制限対策
+        time.sleep(1)  # レート制限対策
     
-    logger.log(f"検索完了: {len(all_urls)}件のURL取得", "INFO")
-    return all_urls
+    if all_results:
+        logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
+    else:
+        logger.log(f"⚠️ {site_name}: URL未発見", "WARNING")
+    
+    return all_results
 
 def extract_urls_from_html(html_content, domain):
-    """HTML から指定ドメインのURLを抽出"""
+    """HTML から指定ドメインのURLを抽出（優先順位付き）"""
     pattern = rf'https?://[^"\s]*{re.escape(domain)}[^"\s]*'
     urls = re.findall(pattern, html_content)
-    # 重複除去とクリーニング
+    
     clean_urls = []
     seen = set()
+    
+    # URLの優先順位付け（価格情報がある可能性が高い順）
+    priority_keywords = [
+        'price', 'catalog', 'product', 'detail', 'item',
+        '価格', 'カタログ', '製品', '商品'
+    ]
+    
+    prioritized = []
+    others = []
+    
     for url in urls:
-        # クエリパラメータを除去
         clean_url = url.split('&')[0].split('#')[0]
-        if clean_url not in seen and len(clean_url) > 20:  # 短すぎるURLを除外
-            seen.add(clean_url)
-            clean_urls.append(clean_url)
-    return clean_urls[:5]  # 最大5件
+        
+        if clean_url in seen or len(clean_url) < 20:
+            continue
+        
+        seen.add(clean_url)
+        
+        # 優先キーワードを含むURLを優先
+        if any(keyword in clean_url.lower() for keyword in priority_keywords):
+            prioritized.append(clean_url)
+        else:
+            others.append(clean_url)
+    
+    # 優先URLを先に、その後その他のURL
+    return (prioritized + others)[:10]
+
+def extract_price_from_search_snippet(search_html, product_name, model, logger):
+    """
+    検索結果スニペットから価格情報を抽出（AIを使用）
+    """
+    logger.log(f"  💡 検索結果から価格情報を抽出中", "DEBUG")
+    
+    try:
+        # 検索結果HTMLを制限
+        search_html = search_html[:30000]
+        
+        prompt = f"""
+以下はGoogle検索結果のHTMLです。化学試薬「{product_name}」に関する価格情報をスニペットから抽出してください。
+
+【抽出する情報】
+1. productName: 製品名
+2. modelNumber: 型番・カタログ番号（あれば）
+3. manufacturer: メーカー名（あれば）
+4. offers: 価格情報のリスト
+   - size: 容量・サイズ
+   - price: 価格（数値のみ）
+   - inStock: 在庫状況（不明な場合はtrue）
+
+【重要】
+- スニペットやタイトルに価格情報（¥、円、price）が含まれている場合は必ず抽出
+- 型番と価格がセットで表示されている場合は対応付けて抽出
+- 価格情報がない場合はoffersを空配列に
+
+【出力形式】
+JSON形式のみ。マークダウン不要。
+
+例:
+{{
+  "productName": "Y-27632",
+  "modelNumber": "ALX-270-333",
+  "manufacturer": "Enzo",
+  "offers": [
+    {{"size": "1 MG", "price": 34000, "inStock": true}},
+    {{"size": "5 MG", "price": 54000, "inStock": true}}
+  ]
+}}
+
+検索結果HTML:
+{search_html}
+"""
+        
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # クリーンアップ
+        response_text = re.sub(r'^```json\s*', '', response_text)
+        response_text = re.sub(r'^```\s*', '', response_text)
+        response_text = re.sub(r'\s*```$', '', response_text)
+        response_text = response_text.strip()
+        
+        price_info = json.loads(response_text)
+        
+        if price_info.get('offers'):
+            logger.log(f"  ✅ スニペットから{len(price_info['offers'])}件の価格情報抽出", "INFO")
+            return price_info
+        else:
+            logger.log(f"  ℹ️ スニペットに価格情報なし", "DEBUG")
+            return None
+            
+    except Exception as e:
+        logger.log(f"  スニペット解析エラー: {str(e)}", "DEBUG")
+        return None
 
 def fetch_page_content(url, logger):
-    """ページコンテンツを取得（Bright Data経由 + 直接アクセスフォールバック）"""
-    logger.log(f"ページ取得中: {url}", "DEBUG")
-    
-    config = get_brightdata_config()
-    
-    # Bright Data経由で試行（POSTメソッド）
-    if config:
-        try:
-            logger.log(f"Bright Data POST経由でページ取得試行...", "DEBUG")
-            proxies = {
-                'http': f"http://{config['username']}:{config['password']}@brd.superproxy.io:33335",
-                'https': f"http://{config['username']}:{config['password']}@brd.superproxy.io:33335"
-            }
-            
-            response = requests.post(
-                url,
-                proxies=proxies,
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            
-            if response.status_code == 200:
-                logger.log(f"✓ ページ取得成功（Bright Data POST）", "DEBUG")
-                return response.text
-        except Exception as e:
-            logger.log(f"Bright Data POST失敗: {str(e)}", "WARNING")
-    
-    # Bright Data GET メソッドで試行
-    if config:
-        try:
-            logger.log(f"Bright Data GET経由でページ取得試行...", "DEBUG")
-            response = requests.get(
-                url,
-                proxies=proxies,
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            
-            if response.status_code == 200:
-                logger.log(f"✓ ページ取得成功（Bright Data GET）", "DEBUG")
-                return response.text
-        except Exception as e:
-            logger.log(f"Bright Data GET失敗: {str(e)}", "WARNING")
-    
-    # 直接アクセス（フォールバック）
+    """ページコンテンツを取得"""
     try:
-        logger.log(f"直接アクセスでページ取得試行...", "DEBUG")
         response = requests.get(
             url,
             timeout=10,
@@ -343,19 +301,17 @@ def fetch_page_content(url, logger):
         )
         
         if response.status_code == 200:
-            logger.log(f"✓ ページ取得成功（直接アクセス）", "DEBUG")
             return response.text
-    except Exception as e:
-        logger.log(f"直接アクセス失敗: {str(e)}", "ERROR")
+    except:
+        pass
     
     return None
 
-def extract_product_info_with_gemini(html_content, product_name, model, logger):
-    """Gemini APIで製品情報を抽出"""
-    logger.log(f"Gemini APIで情報抽出中...", "DEBUG")
+def extract_product_info_from_page(html_content, product_name, model, logger):
+    """ページHTMLから製品情報を抽出"""
+    logger.log(f"  🤖 ページ内容をAI分析中", "DEBUG")
     
     try:
-        # HTMLを最初の50000文字に制限
         html_content = html_content[:50000]
         
         prompt = f"""
@@ -368,18 +324,17 @@ def extract_product_info_with_gemini(html_content, product_name, model, logger):
 4. offers: 価格情報のリスト
    - size: 容量・サイズ
    - price: 価格（数値のみ、カンマなし）
-   - inStock: 在庫状況（true/false）
+   - inStock: 在庫状況（true/false、不明な場合はtrue）
 
 【出力形式】
-必ずJSON形式で出力してください。マークダウンのコードブロック（```json）は使用しないでください。
+JSON形式のみ。マークダウン不要。
 
 {{
   "productName": "製品名",
   "modelNumber": "型番",
   "manufacturer": "メーカー名",
   "offers": [
-    {{"size": "1 MG", "price": 34000, "inStock": true}},
-    {{"size": "5 MG", "price": 130800, "inStock": true}}
+    {{"size": "1 MG", "price": 34000, "inStock": true}}
   ]
 }}
 
@@ -388,43 +343,111 @@ HTMLコンテンツ:
 """
         
         response = model.generate_content(prompt)
-        logger.log(f"✓ Gemini API応答受信", "DEBUG")
-        
-        # レスポンステキストを取得
         response_text = response.text.strip()
         
-        # マークダウンコードブロックを除去
+        # クリーンアップ
         response_text = re.sub(r'^```json\s*', '', response_text)
         response_text = re.sub(r'^```\s*', '', response_text)
         response_text = re.sub(r'\s*```$', '', response_text)
         response_text = response_text.strip()
         
-        # JSON解析
         product_info = json.loads(response_text)
-        logger.log(f"✓ 製品情報抽出成功", "INFO")
+        
+        if product_info.get('offers'):
+            logger.log(f"  ✅ ページから{len(product_info['offers'])}件の価格情報抽出", "INFO")
+        else:
+            logger.log(f"  ℹ️ ページに価格情報なし", "DEBUG")
+        
         return product_info
         
-    except json.JSONDecodeError as e:
-        logger.log(f"JSON解析エラー: {str(e)}", "ERROR")
-        logger.log(f"レスポンス: {response_text[:500]}", "DEBUG")
-        return None
     except Exception as e:
-        logger.log(f"情報抽出エラー: {str(e)}", "ERROR")
+        logger.log(f"  ページ解析エラー: {str(e)}", "DEBUG")
         return None
 
+def merge_product_info(snippet_info, page_info):
+    """
+    スニペット情報とページ情報をマージ
+    価格情報が多い方を優先、他の情報は補完
+    """
+    if not snippet_info and not page_info:
+        return None
+    
+    if not snippet_info:
+        return page_info
+    
+    if not page_info:
+        return snippet_info
+    
+    # 価格情報が多い方をベースに
+    if len(snippet_info.get('offers', [])) >= len(page_info.get('offers', [])):
+        merged = snippet_info.copy()
+        # ページ情報で不足を補完
+        if not merged.get('productName'):
+            merged['productName'] = page_info.get('productName')
+        if not merged.get('modelNumber'):
+            merged['modelNumber'] = page_info.get('modelNumber')
+        if not merged.get('manufacturer'):
+            merged['manufacturer'] = page_info.get('manufacturer')
+    else:
+        merged = page_info.copy()
+        # スニペット情報で不足を補完
+        if not merged.get('productName'):
+            merged['productName'] = snippet_info.get('productName')
+        if not merged.get('modelNumber'):
+            merged['modelNumber'] = snippet_info.get('modelNumber')
+        if not merged.get('manufacturer'):
+            merged['manufacturer'] = snippet_info.get('manufacturer')
+    
+    return merged
+
+def display_product_card(product, idx):
+    """製品情報を見やすく表示"""
+    st.markdown(f'<div class="product-card">', unsafe_allow_html=True)
+    
+    # タイトル
+    product_name = product.get('productName', '製品名不明')
+    site_name = product.get('source_site', '不明')
+    st.markdown(f'<div class="product-title">📦 {product_name}</div>', unsafe_allow_html=True)
+    
+    # 基本情報
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown(f'<div class="product-info"><strong>販売元:</strong> {site_name}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="product-info"><strong>型番:</strong> {product.get("modelNumber", "N/A")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="product-info"><strong>メーカー:</strong> {product.get("manufacturer", "N/A")}</div>', unsafe_allow_html=True)
+    
+    with col2:
+        source_url = product.get('source_url', '#')
+        st.markdown(f'<div class="product-info"><strong>URL:</strong> <a href="{source_url}" target="_blank">製品ページを開く</a></div>', unsafe_allow_html=True)
+    
+    # 価格情報
+    if 'offers' in product and product['offers']:
+        st.markdown("**💰 価格情報:**")
+        
+        for offer in product['offers']:
+            size = offer.get('size', 'N/A')
+            price = offer.get('price', 0)
+            price_str = f"¥{price:,}" if price else 'N/A'
+            stock = offer.get('inStock', False)
+            stock_icon = "✅" if stock else "❌"
+            stock_text = "在庫あり" if stock else "在庫なし"
+            
+            st.markdown(
+                f'<div class="price-row">'
+                f'<strong>{size}</strong>: {price_str} {stock_icon} {stock_text}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.warning("⚠️ 価格情報が取得できませんでした")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（本番版）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（強化版）</h1>', unsafe_allow_html=True)
     
-    # 対象サイト表示
-    st.markdown("### 📊 対象ECサイト（11サイト）")
-    cols = st.columns(4)
-    for idx, (key, site) in enumerate(TARGET_SITES.items()):
-        with cols[idx % 4]:
-            st.markdown(f'<span class="site-badge">{site["name"]}</span>', unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # 設定セクション
+    # 入力セクション
     col1, col2 = st.columns([3, 1])
     
     with col1:
@@ -435,16 +458,13 @@ def main():
         )
     
     with col2:
-        max_urls = st.number_input(
-            "最大取得URL数",
+        max_sites = st.number_input(
+            "最大検索サイト数",
             min_value=1,
-            max_value=20,
-            value=10,
+            max_value=11,
+            value=5,
             step=1
         )
-    
-    # デバッグログ表示モード
-    show_debug = st.checkbox("🐛 デバッグログを表示", value=False)
     
     st.markdown("---")
     
@@ -455,12 +475,14 @@ def main():
             return
         
         # ログコンテナ
+        st.markdown("### 📝 処理ログ")
         log_container = st.empty()
-        logger = RealTimeLogger(log_container, show_debug=show_debug)
+        logger = RealTimeLogger(log_container)
         
         # 処理開始
         start_time = time.time()
-        logger.log(f"処理開始: {product_name}", "INFO")
+        logger.log(f"🚀 処理開始: {product_name}", "INFO")
+        logger.log(f"📊 戦略: 多層価格抽出（スニペット+ページ）", "INFO")
         
         # Gemini API設定
         model = setup_gemini()
@@ -468,65 +490,66 @@ def main():
             st.error("❌ Gemini APIの設定に失敗しました")
             return
         
-        # 進行状況
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # URL検索
-        status_text.text("🔎 製品URLを検索中...")
-        progress_bar.progress(20)
-        
-        urls = search_product_urls(product_name, TARGET_SITES, logger, max_urls=max_urls)
-        
-        if not urls:
-            st.error("❌ 製品URLが見つかりませんでした")
-            logger.log("検索結果なし", "ERROR")
-            return
-        
-        st.success(f"✅ {len(urls)}件のURLを発見しました")
-        
-        # 製品情報抽出
-        status_text.text("📊 製品情報を抽出中...")
-        progress_bar.progress(40)
-        
+        # 各サイトから検索
         all_products = []
+        sites_to_search = dict(list(TARGET_SITES.items())[:max_sites])
         
-        for idx, url_info in enumerate(urls):
-            logger.log(f"処理中 ({idx+1}/{len(urls)}): {url_info['site']}", "INFO")
-            
-            # ページ取得
-            html_content = fetch_page_content(url_info['url'], logger)
-            
-            if not html_content:
-                logger.log(f"ページ取得失敗: {url_info['url']}", "WARNING")
+        for site_key, site_info in sites_to_search.items():
+            # フォールバックURL確認
+            if product_name in FALLBACK_URLS and site_key in FALLBACK_URLS[product_name]:
+                fallback_url = FALLBACK_URLS[product_name][site_key]
+                logger.log(f"✓ {site_info['name']}: フォールバックURL使用", "INFO")
+                
+                html_content = fetch_page_content(fallback_url, logger)
+                if html_content:
+                    product_info = extract_product_info_from_page(html_content, product_name, model, logger)
+                    if product_info:
+                        product_info['source_site'] = site_info['name']
+                        product_info['source_url'] = fallback_url
+                        all_products.append(product_info)
+                
+                time.sleep(1)
                 continue
             
-            # 情報抽出
-            product_info = extract_product_info_with_gemini(
-                html_content, 
-                product_name, 
-                model, 
+            # 多層検索戦略
+            search_results = search_with_strategy(product_name, site_info, logger)
+            
+            if not search_results:
+                continue
+            
+            # 最初の検索結果を処理
+            result = search_results[0]
+            
+            # 戦略1: 検索結果スニペットから価格抽出
+            snippet_info = extract_price_from_search_snippet(
+                result['search_html'],
+                product_name,
+                model,
                 logger
             )
             
-            if product_info:
-                product_info['source_site'] = url_info['site']
-                product_info['source_url'] = url_info['url']
-                all_products.append(product_info)
-                logger.log(f"✓ {url_info['site']}から情報抽出成功", "INFO")
+            # 戦略2: ページ内容から情報抽出
+            page_info = None
+            html_content = fetch_page_content(result['url'], logger)
+            if html_content:
+                page_info = extract_product_info_from_page(html_content, product_name, model, logger)
             
-            # 進捗更新
-            progress = 40 + int((idx + 1) / len(urls) * 50)
-            progress_bar.progress(progress)
+            # 情報をマージ
+            merged_info = merge_product_info(snippet_info, page_info)
             
-            time.sleep(1)  # レート制限対策
-        
-        progress_bar.progress(100)
-        status_text.text("✅ 処理完了")
+            if merged_info:
+                merged_info['source_site'] = result['site']
+                merged_info['source_url'] = result['url']
+                all_products.append(merged_info)
+                logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
+            else:
+                logger.log(f"⚠️ {result['site']}: 製品情報取得失敗", "WARNING")
+            
+            time.sleep(2)
         
         # 実行時間
         elapsed_time = time.time() - start_time
-        logger.log(f"処理完了: {elapsed_time:.1f}秒", "INFO")
+        logger.log(f"🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
         
         # 結果表示
         st.markdown("---")
@@ -536,27 +559,15 @@ def main():
             st.warning("⚠️ 製品情報を抽出できませんでした")
             return
         
-        st.success(f"✅ {len(all_products)}件の製品情報を取得しました")
+        # 価格情報があるものとないものを分類
+        with_price = [p for p in all_products if p.get('offers')]
+        without_price = [p for p in all_products if not p.get('offers')]
         
-        # 製品情報表示
-        for idx, product in enumerate(all_products):
-            with st.expander(f"📦 {product.get('productName', '不明')} - {product.get('source_site', '不明')}", expanded=True):
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.markdown(f"**製品名:** {product.get('productName', 'N/A')}")
-                    st.markdown(f"**型番:** {product.get('modelNumber', 'N/A')}")
-                    st.markdown(f"**メーカー:** {product.get('manufacturer', 'N/A')}")
-                    st.markdown(f"**サイト:** {product.get('source_site', 'N/A')}")
-                    st.markdown(f"**URL:** [{product.get('source_url', 'N/A')}]({product.get('source_url', '#')})")
-                
-                with col2:
-                    if 'offers' in product and product['offers']:
-                        st.markdown("**価格情報:**")
-                        for offer in product['offers']:
-                            price_str = f"¥{offer.get('price', 0):,}" if offer.get('price') else 'N/A'
-                            stock_str = "✅ 在庫あり" if offer.get('inStock') else "❌ 在庫なし"
-                            st.markdown(f"- {offer.get('size', 'N/A')}: {price_str} ({stock_str})")
+        st.success(f"✅ {len(all_products)}件の製品情報を取得（価格情報あり: {len(with_price)}件、処理時間: {elapsed_time:.1f}秒）")
+        
+        # 製品情報表示（価格情報ありを優先）
+        for idx, product in enumerate(with_price + without_price):
+            display_product_card(product, idx)
         
         # CSV出力
         st.markdown("---")
@@ -569,7 +580,7 @@ def main():
                 '製品名': product.get('productName', 'N/A'),
                 '型番': product.get('modelNumber', 'N/A'),
                 'メーカー': product.get('manufacturer', 'N/A'),
-                'サイト': product.get('source_site', 'N/A'),
+                '販売元': product.get('source_site', 'N/A'),
                 'URL': product.get('source_url', 'N/A')
             }
             
@@ -601,25 +612,6 @@ def main():
             mime="text/csv",
             use_container_width=True
         )
-        
-        # 統計情報
-        st.markdown("---")
-        st.markdown("## 📈 統計情報")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("取得サイト数", len(all_products))
-        
-        with col2:
-            total_offers = sum(len(p.get('offers', [])) for p in all_products)
-            st.metric("価格情報数", total_offers)
-        
-        with col3:
-            st.metric("処理時間", f"{elapsed_time:.1f}秒")
-        
-        with col4:
-            st.metric("検索URL数", len(urls))
 
 if __name__ == "__main__":
     main()
