@@ -109,9 +109,7 @@ def setup_gemini():
 def check_serp_api_config():
     """SERP API認証情報の確認"""
     try:
-        # APIキー認証
         if "BRIGHTDATA_API_KEY" in st.secrets:
-            # ゾーン名も確認
             zone_name = st.secrets.get("BRIGHTDATA_ZONE_NAME", "serp_api1")
             return {
                 'provider': 'brightdata',
@@ -144,24 +142,19 @@ TARGET_SITES = {
 }
 
 def search_with_brightdata_serp(query, serp_config, logger):
-    """Bright Data SERP APIで検索（正しいエンドポイント）"""
+    """Bright Data SERP APIで検索"""
     try:
         logger.log(f"  🔌 Bright Data SERP API使用", "DEBUG")
         logger.log(f"  🔑 APIキー認証を使用", "DEBUG")
         
-        # 正しいエンドポイント
         api_url = "https://api.brightdata.com/request"
-        
-        # Google検索URL作成
         search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=ja&gl=jp"
         
-        # ヘッダー
         headers = {
             'Authorization': f'Bearer {serp_config["api_key"]}',
             'Content-Type': 'application/json'
         }
         
-        # ペイロード
         payload = {
             'zone': serp_config['zone_name'],
             'url': search_url,
@@ -170,17 +163,10 @@ def search_with_brightdata_serp(query, serp_config, logger):
         
         logger.log(f"  📡 検索URL: {search_url[:80]}...", "DEBUG")
         
-        # POSTリクエスト
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
             logger.log(f"  ✓ SERP API応答成功", "DEBUG")
-            # rawフォーマットの場合、HTMLが返される
             return {'html': response.text, 'status': 'success'}
         elif response.status_code == 401:
             logger.log(f"  ❌ 認証エラー: APIキーを確認してください", "ERROR")
@@ -205,7 +191,6 @@ def extract_urls_from_html(html_content, domain, logger):
     urls = []
     
     try:
-        # URLパターン
         patterns = [
             rf'https?://(?:www\.)?{re.escape(domain)}[^\s<>"\']*',
             rf'href="(https?://(?:www\.)?{re.escape(domain)}[^"]*)"',
@@ -220,20 +205,14 @@ def extract_urls_from_html(html_content, domain, logger):
                 if url.startswith('http') and len(url) > 20:
                     all_urls.add(url)
         
-        # タイトルとスニペットも抽出
-        # Googleの検索結果構造を解析
-        result_pattern = r'<div[^>]*class="[^"]*g[^"]*"[^>]*>(.*?)</div>'
-        results = re.findall(result_pattern, html_content, re.DOTALL)
-        
         for url in list(all_urls)[:10]:
-            # 除外パターン
             if any(x in url.lower() for x in ['google.com', 'youtube.com', 'facebook.com']):
                 continue
                 
             urls.append({
                 'url': url,
-                'title': 'N/A',  # HTMLパース簡略化のため
-                'snippet': 'N/A'
+                'title': '',
+                'snippet': ''
             })
         
         if urls:
@@ -254,12 +233,10 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
     
     logger.log(f"🔍 {site_name}を検索中", "INFO")
     
-    # SERP API利用可能性チェック
     if not serp_config['available']:
         logger.log(f"  ❌ SERP API未設定", "ERROR")
         return []
     
-    # 検索クエリパターン（優先順）
     search_queries = [
         f"{product_name} 価格 site:{domain}",
         f"{product_name} site:{domain}",
@@ -271,7 +248,6 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
     for query_idx, query in enumerate(search_queries):
         logger.log(f"  検索パターン{query_idx+1}: {query[:60]}...", "DEBUG")
         
-        # SERP APIで検索
         serp_data = search_with_brightdata_serp(query, serp_config, logger)
         
         if not serp_data:
@@ -279,7 +255,6 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
             time.sleep(2)
             continue
         
-        # HTMLからURLを抽出
         urls = extract_urls_from_html(serp_data['html'], domain, logger)
         
         if urls:
@@ -287,15 +262,14 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
                 all_results.append({
                     'url': url_data['url'],
                     'site': site_name,
-                    'title': url_data['title'],
-                    'snippet': url_data['snippet'],
+                    'title': url_data.get('title', ''),
+                    'snippet': url_data.get('snippet', ''),
                     'html': serp_data['html']
                 })
             
             logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
             break
         
-        # 次のクエリまで待機
         time.sleep(2)
     
     if all_results:
@@ -304,60 +278,6 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
         logger.log(f"⚠️ {site_name}: URL未発見", "WARNING")
     
     return all_results
-
-def extract_price_from_snippet(snippet, title, product_name, model, logger):
-    """スニペットとタイトルから価格情報を抽出"""
-    logger.log(f"  💡 スニペット分析中", "DEBUG")
-    
-    try:
-        prompt = f"""
-以下のGoogle検索結果のタイトルとスニペットから、化学試薬「{product_name}」の価格情報を抽出してください。
-
-【タイトル】
-{title}
-
-【スニペット】
-{snippet}
-
-【抽出する情報】
-1. productName: 製品名
-2. modelNumber: 型番・カタログ番号（あれば）
-3. manufacturer: メーカー名（あれば）
-4. offers: 価格情報のリスト
-   - size: 容量・サイズ
-   - price: 価格（数値のみ）
-   - inStock: 在庫状況（不明な場合はtrue）
-
-【重要】
-- 価格情報（¥、円、$、price）が含まれている場合は必ず抽出
-- 型番と価格がセットで表示されている場合は対応付けて抽出
-- 価格情報がない場合はoffersを空配列に
-
-【出力形式】
-JSON形式のみ。マークダウン不要。
-"""
-        
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
-        
-        # クリーンアップ
-        response_text = re.sub(r'^```json\s*', '', response_text)
-        response_text = re.sub(r'^```\s*', '', response_text)
-        response_text = re.sub(r'\s*```$', '', response_text)
-        response_text = response_text.strip()
-        
-        price_info = json.loads(response_text)
-        
-        if price_info.get('offers'):
-            logger.log(f"  ✅ スニペットから{len(price_info['offers'])}件の価格抽出", "INFO")
-            return price_info
-        else:
-            logger.log(f"  ℹ️ スニペットに価格情報なし", "DEBUG")
-            return None
-            
-    except Exception as e:
-        logger.log(f"  スニペット解析エラー: {str(e)}", "DEBUG")
-        return None
 
 def fetch_page_content(url, logger):
     """ページコンテンツを取得"""
@@ -391,13 +311,29 @@ def extract_product_info_from_page(html_content, product_name, model, logger):
 以下のHTMLから化学試薬「{product_name}」の製品情報を抽出してください。
 
 【抽出情報】
-1. productName: 製品名
-2. modelNumber: 型番
-3. manufacturer: メーカー名
-4. offers: 価格情報
-   - size, price, inStock
+1. productName: 製品名（文字列）
+2. modelNumber: 型番（文字列）
+3. manufacturer: メーカー名（文字列）
+4. offers: 価格情報の配列
+   各要素:
+   - size: 容量・サイズ（文字列）
+   - price: 価格（数値型、カンマなし）
+   - inStock: 在庫状況（真偽値）
 
-JSON形式で出力。
+【重要】
+- priceは必ず数値型（整数または小数）で返す
+- 価格がない場合はoffersを空配列[]にする
+- 文字列は引用符で囲む
+
+JSON形式で出力:
+{{
+  "productName": "製品名",
+  "modelNumber": "型番",
+  "manufacturer": "メーカー",
+  "offers": [
+    {{"size": "10mg", "price": 12000, "inStock": true}}
+  ]
+}}
 
 HTMLコンテンツ:
 {html_content}
@@ -413,6 +349,20 @@ HTMLコンテンツ:
         
         product_info = json.loads(response_text)
         
+        # データ型の検証と修正
+        if 'offers' in product_info and isinstance(product_info['offers'], list):
+            for offer in product_info['offers']:
+                if 'price' in offer:
+                    # 価格を数値に変換
+                    try:
+                        if isinstance(offer['price'], str):
+                            # カンマを削除して数値化
+                            offer['price'] = float(offer['price'].replace(',', '').replace('¥', '').replace('円', '').strip())
+                        else:
+                            offer['price'] = float(offer['price'])
+                    except:
+                        offer['price'] = 0
+        
         if product_info.get('offers'):
             logger.log(f"  ✅ ページから{len(product_info['offers'])}件の価格抽出", "INFO")
         else:
@@ -423,37 +373,6 @@ HTMLコンテンツ:
     except Exception as e:
         logger.log(f"  ページ解析エラー: {str(e)}", "DEBUG")
         return None
-
-def merge_product_info(snippet_info, page_info):
-    """情報をマージ"""
-    if not snippet_info and not page_info:
-        return None
-    
-    if not snippet_info:
-        return page_info
-    
-    if not page_info:
-        return snippet_info
-    
-    # 価格情報が多い方をベースに
-    if len(snippet_info.get('offers', [])) >= len(page_info.get('offers', [])):
-        merged = snippet_info.copy()
-        if not merged.get('productName'):
-            merged['productName'] = page_info.get('productName')
-        if not merged.get('modelNumber'):
-            merged['modelNumber'] = page_info.get('modelNumber')
-        if not merged.get('manufacturer'):
-            merged['manufacturer'] = page_info.get('manufacturer')
-    else:
-        merged = page_info.copy()
-        if not merged.get('productName'):
-            merged['productName'] = snippet_info.get('productName')
-        if not merged.get('modelNumber'):
-            merged['modelNumber'] = snippet_info.get('modelNumber')
-        if not merged.get('manufacturer'):
-            merged['manufacturer'] = snippet_info.get('manufacturer')
-    
-    return merged
 
 def display_product_card(product, idx):
     """製品情報を表示"""
@@ -480,7 +399,16 @@ def display_product_card(product, idx):
         for offer in product['offers']:
             size = offer.get('size', 'N/A')
             price = offer.get('price', 0)
-            price_str = f"¥{price:,}" if price else 'N/A'
+            
+            # 価格フォーマット修正
+            try:
+                if isinstance(price, (int, float)) and price > 0:
+                    price_str = f"¥{int(price):,}"
+                else:
+                    price_str = 'N/A'
+            except:
+                price_str = 'N/A'
+            
             stock = offer.get('inStock', False)
             stock_icon = "✅" if stock else "❌"
             stock_text = "在庫あり" if stock else "在庫なし"
@@ -497,12 +425,10 @@ def display_product_card(product, idx):
     st.markdown('</div>', unsafe_allow_html=True)
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 v3）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（SERP API版 Final）</h1>', unsafe_allow_html=True)
     
-    # SERP API設定チェック
     serp_config = check_serp_api_config()
     
-    # API状態表示
     if serp_config['available']:
         st.markdown(
             f'<div class="api-status api-success">✅ SERP API接続: BRIGHTDATA (Zone: {serp_config["zone_name"]})</div>',
@@ -519,7 +445,7 @@ def main():
         `.streamlit/secrets.toml`に以下を追加:
         ```toml
         BRIGHTDATA_API_KEY = "your_api_key"
-        BRIGHTDATA_ZONE_NAME = "serp_api1"  # オプション（デフォルト: serp_api1）
+        BRIGHTDATA_ZONE_NAME = "serp_api1"
         ```
         """)
     
@@ -543,7 +469,6 @@ def main():
     
     st.markdown("---")
     
-    # 検索ボタン（SERP API未設定時は無効化）
     search_disabled = not serp_config['available']
     
     if st.button("🚀 検索開始", type="primary", use_container_width=True, disabled=search_disabled):
@@ -574,30 +499,19 @@ def main():
                 time.sleep(2)
                 continue
             
+            # 最初のURLを使用
             result = search_results[0]
             
-            # スニペット分析
-            snippet_info = extract_price_from_snippet(
-                result['snippet'],
-                result['title'],
-                product_name,
-                model,
-                logger
-            )
-            
-            # ページ分析
+            # ページ分析のみ（スニペットは現在空なのでスキップ）
             page_info = None
             html_content = fetch_page_content(result['url'], logger)
             if html_content:
                 page_info = extract_product_info_from_page(html_content, product_name, model, logger)
             
-            # マージ
-            merged_info = merge_product_info(snippet_info, page_info)
-            
-            if merged_info:
-                merged_info['source_site'] = result['site']
-                merged_info['source_url'] = result['url']
-                all_products.append(merged_info)
+            if page_info:
+                page_info['source_site'] = result['site']
+                page_info['source_url'] = result['url']
+                all_products.append(page_info)
                 logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
             else:
                 logger.log(f"⚠️ {result['site']}: 製品情報取得失敗", "WARNING")
@@ -640,7 +554,14 @@ def main():
                 for offer in product['offers']:
                     row = base_info.copy()
                     row['サイズ'] = offer.get('size', 'N/A')
-                    row['価格'] = offer.get('price', 0)
+                    
+                    # 価格の安全な処理
+                    try:
+                        price = offer.get('price', 0)
+                        row['価格'] = int(price) if isinstance(price, (int, float)) else 0
+                    except:
+                        row['価格'] = 0
+                    
                     row['在庫'] = '有' if offer.get('inStock') else '無'
                     export_data.append(row)
             else:
