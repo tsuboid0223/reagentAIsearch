@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-コスモバイオ限定テスト版製品調達AIエージェント Streamlitアプリケーション
+製品調達AIエージェント Streamlitアプリケーション
 （プロキシ接続によるStreamlit Cloud制約回避・最終確定版）
 """
 
@@ -25,42 +25,47 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_page_content_with_brightdata(url: str, brd_username: str, brd_password: str) -> dict:
     """
-    Scraping Browserで生bodyテキスト抽出（ハング/timeout調整）。
+    Scraping Browserで生bodyテキスト抽出（ハング回避 + フォールバック）。
     """
     BRD_HOST = 'brd.superproxy.io'
     BRD_PORT = 24000  # HTTP Browserポート
     proxy_url = f'http://{brd_username}:{brd_password}@{BRD_HOST}:{BRD_PORT}'
     proxies = {'http': proxy_url, 'https': proxy_url}
     headers = {
-        'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
     }
     result = {"url": url, "status_code": None, "content": None, "error": None}
     
+    # 1. Scraping Browser試行
     payload = {
         'url': url,
         'renderJS': True,
-        'waitFor': 5000,
-        'headers': headers  # UA偽装追加
+        'waitFor': 3000,
+        'proxy': 'residential'  # 住宅IP優先
     }
-    
-    for attempt in range(3):
+    try:
+        response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        html = data.get('content', response.text)
+    except Exception as e:
+        # フォールバック: シンプルプロキシGET
+        full_url = f'{proxy_url}/{url}'
         try:
-            response = requests.post(proxy_url, json=payload, headers=headers, proxies=proxies, verify=False, timeout=150)  # 延長
-            result["status_code"] = response.status_code
+            response = requests.get(full_url, headers=headers, proxies=proxies, verify=False, timeout=30)
             response.raise_for_status()
-            data = response.json()
-            html = data.get('content', response.text)
-            soup = BeautifulSoup(html, 'html.parser')
-            for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
-                tag.decompose()
-            result["content"] = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
-            result["content"] = result["content"][:18000]
-            result["error"] = None
+            html = response.text
+        except Exception as e2:
+            result["error"] = str(e) + "; fallback: " + str(e2)
             return result
-        except Exception as e:
-            result["error"] = str(e)
-            time.sleep(random.uniform(5, 10))
+    
+    # テキスト抽出
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
+        tag.decompose()
+    result["content"] = soup.body.get_text(separator=' ', strip=True) if soup.body else ''
+    result["content"] = result["content"][:18000]
+    result["status_code"] = 200
     return result
 
 
@@ -98,7 +103,7 @@ def search_product_urls_with_brightdata(query: str, api_key: str) -> list:
                         a_tag = div.find('a', href=True)
                         if a_tag and a_tag.get('href') and a_tag.get('href').startswith('http') and not a_tag.get('href').startswith('https://www.google.'):
                             urls.append(a_tag.get('href'))
-                    unique_urls = list(dict.fromkeys(urls))[:5]  # テスト用に5件制限
+                    unique_urls = list(dict.fromkeys(urls))[:10]
                     st.success(f"【Bright Data】「{query}」から{len(unique_urls)}件のURLを抽出しました。")
                     return unique_urls
                 elif result_response.status_code != 202: return []
@@ -154,9 +159,8 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     manufacturer = product_info.get('Manufacturer', '')
     st.subheader(f"【統括エージェント】 \"{product_name}\" の情報収集を開始します。")
 
-    # コスモバイオ限定
     base_query = f"{manufacturer} {product_name}"
-    site_map = {'コスモバイオ': 'cosmobio.co.jp'}
+    site_map = { 'コスモバイオ': 'cosmobio.co.jp', 'フナコシ': 'funakoshi.co.jp', 'AXEL': 'axel.as-1.co.jp', 'Selleck': 'selleck.co.jp', 'MCE': 'medchemexpress.com', 'Nakarai': 'nacalai.co.jp', 'FUJIFILM': 'labchem-wako.fujifilm.com', '関東化学': 'kanto.co.jp', 'TCI': 'tcichemicals.com', 'Merck': 'merck.com', '和光純薬': 'hpc-j.co.jp' }
     search_queries = [f"site:{site_map[site_name]} {base_query}" for site_name in preferred_sites if site_name in site_map]
     search_queries.append(base_query)
 
@@ -179,10 +183,10 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
         progress_bar.progress(progress)
         status_text.text(f"URL抽出中... ({i+1}/{num_queries})")
     
-    unique_urls = list(dict.fromkeys(all_urls))[:5]  # テスト用5件制限
+    unique_urls = list(dict.fromkeys(all_urls))
     if not unique_urls: return [], []
     
-    st.info(f"{len(unique_urls)}件のHTMLページをコスモバイオから取得・分析します...")
+    st.info(f"{len(unique_urls)}件のHTMLページを並列で取得・分析します...")
     progress_bar.progress(0.2)
     status_text.text("URL抽出完了 (20%)")
 
@@ -238,7 +242,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
 # === Streamlit UI アプリケーション部分 ===
 # ==============================================================================
 st.set_page_config(layout="wide")
-st.title("製品調達AIエージェント (コスモバイオ限定テスト版)")
+st.title("製品調達AIエージェント")
 
 st.sidebar.header("APIキー設定")
 try:
@@ -267,7 +271,7 @@ if search_button:
     else:
         with st.spinner('AIエージェントが情報収集中...'):
             product_info = {'ProductName': product_name_input, 'Manufacturer': manufacturer_input}
-            preferred_sites = ['コスモバイオ']  # 限定
+            preferred_sites = ['コスモバイオ', 'フナコシ', 'AXEL', 'Selleck', 'MCE', 'Nakarai', 'FUJIFILM', '関東化学', 'TCI', 'Merck', '和光純薬']
             
             pages_list, log_data = orchestrator_agent(product_info, gemini_api_key, brightdata_api_key, brightdata_username, brightdata_password, preferred_sites, debug_mode=debug_mode_checkbox)
             
