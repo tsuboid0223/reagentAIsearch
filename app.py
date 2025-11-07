@@ -174,7 +174,7 @@ def orchestrator_agent(product_info: dict, gemini_api_key: str, brightdata_api_k
     my_bar = st.progress(0, text="Webページを取得中...")
     all_page_content_results, found_pages_data = [], []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) -> tuple[list, list]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:  # ハング回避
         future_to_url = {executor.submit(get_page_content_with_brightdata, url, brd_username, brd_password): url for url in unique_urls}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
             all_page_content_results.append(future.result())
@@ -255,7 +255,7 @@ if search_button:
             
             if not final_results:
                 st.warning("検索結果から有効な製品情報が見つかりませんでした。")
-                search_term = f"{product_info.get('manufacturer', '')} {product_info['ProductName']}"
+                search_term = f"{product_info.get('Manufacturer', '')} {product_info['ProductName']}"
                 query_url = f"https://www.google.com/search?q={urllib.parse.quote(search_term)}"
                 final_results.append({ '入力日': input_date, '製品名': product_info['ProductName'], '型番/製品番号': 'N/A', '仕様': 'N/A', 'メーカー': product_info.get('Manufacturer', ''), 'リスト単価': 0, '在庫': 'なし/不明', '情報元URL': query_url })
             
