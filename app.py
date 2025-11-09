@@ -506,6 +506,18 @@ def fetch_page_with_browser(url, logger):
     return None, None
 
 
+def generate_direct_urls(product_name, domain, logger):
+    """直接URL生成（予測可能なURL構造を持つサイト用）"""
+    direct_urls = []
+    
+    # MCE: lowercase product name
+    if 'medchemexpress.com' in domain:
+        clean_name = product_name.lower().replace(' ', '-').replace('_', '-')
+        direct_urls.append(f"https://www.{domain}/{clean_name}.html")
+        logger.log(f"  📍 直接URL生成: https://www.{domain}/{clean_name}.html", "DEBUG")
+    
+    return direct_urls
+
 def search_with_strategy(product_name, site_info, serp_config, logger):
     """検索戦略（SERP API使用 + v3.12: 同義語・スペルチェック）"""
     try:
@@ -612,10 +624,26 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
         logger.log(f"📋 詳細: {error_detail[:500]}", "DEBUG")
         return []
     
+    # v3.16: 直接URL生成（最後のフォールバック）
+    if not all_results:
+        logger.log(f"  🔄 直接URL生成を試行", "INFO")
+        direct_urls = generate_direct_urls(product_name, domain, logger)
+        
+        for url in direct_urls:
+            all_results.append({
+                'url': url,
+                'site': site_name,
+                'score': 15,  # 直接生成URLに高スコア
+                'search_term_used': f"{product_name} (直接URL)"
+            })
+        
+        if direct_urls:
+            logger.log(f"  ✅ 直接URL生成: {len(direct_urls)}件", "INFO")
+    
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
     else:
-        logger.log(f"❌ {site_name}: URL未発見（全ての検索用語 + mgフォールバックで試行済み）", "ERROR")
+        logger.log(f"❌ {site_name}: URL未発見（全ての検索戦略で試行済み）", "ERROR")
     
     return all_results
 
