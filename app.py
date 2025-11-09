@@ -10,10 +10,13 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 import urllib.parse
 from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import difflib
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬情報収集システム v3.9 （究極版）",
+    page_title="化学試薬情報収集システム v3.12 （スペルチェック版）",
     page_icon="🧪",
     layout="wide"
 )
@@ -46,19 +49,22 @@ st.markdown("""
 SIMILARITY_THRESHOLD = 0.5  # 製品名類似度の閾値
 MIN_HTML_SIZE = 5000  # 最小HTMLサイズ（バイト）
 
-# リアルタイムログクラス
+# リアルタイムログクラス（v3.11: スレッドセーフ対応）
 class RealTimeLogger:
     def __init__(self, container):
         self.container = container
         self.logs = []
+        self.lock = threading.Lock()  # v3.11: 並列処理のためのロック
         
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] [{level}] {message}"
-        self.logs.append(log_entry)
         
-        with self.container:
-            st.code("\n".join(self.logs[-50:]), language="log")
+        with self.lock:  # v3.11: スレッドセーフなログ追加
+            self.logs.append(log_entry)
+            
+            with self.container:
+                st.code("\n".join(self.logs[-50:]), language="log")
 
 # Gemini API設定
 def setup_gemini():
@@ -107,6 +113,117 @@ TARGET_SITES = {
     # "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}  # v3.9で除外
 }
 
+# v3.12: 化学品名データベース（スペルチェック用）
+CHEMICAL_NAMES_DB = [
+    "Y-27632", "Y27632", "SB431542", "SB-431542", "LY294002", "PD98059", "PD-98059",
+    "Wortmannin", "Rapamycin", "Mofezolac", "Mofeolac", "Ibuprofen", "Indomethacin",
+    "Diclofenac", "Dexamethasone", "Prednisolone", "Hydrocortisone", "Imatinib",
+    "Gefitinib", "Erlotinib", "Sorafenib", "Sunitinib", "Cyclosporine", "Tacrolimus",
+    "Methotrexate", "Cisplatin", "Doxorubicin", "Paclitaxel", "Vincristine",
+]
+
+# v3.12: 同義語・別名辞書
+CHEMICAL_SYNONYMS = {
+    "Mofezolac": {
+        "canonical_name": "Mofezolac",
+        "synonyms": ["Mofezolac", "Mofeolac", "78967-07-4", "3,4-Bis(4-methoxyphenyl)-5-isoxazoleacetic acid", "DISOPAIN"],
+        "cas_rn": "78967-07-4",
+    },
+    "Y-27632": {
+        "canonical_name": "Y-27632",
+        "synonyms": ["Y-27632", "Y27632", "129830-38-2", "trans-4-[(1R)-1-Aminoethyl]-N-4-pyridinylcyclohexanecarboxamide", "Y 27632"],
+        "cas_rn": "129830-38-2",
+    },
+    "SB431542": {
+        "canonical_name": "SB431542",
+        "synonyms": ["SB431542", "SB-431542", "SB 431542", "301836-41-9"],
+        "cas_rn": "301836-41-9",
+    },
+    "LY294002": {
+        "canonical_name": "LY294002",
+        "synonyms": ["LY294002", "LY-294002", "LY 294002", "154447-36-6"],
+        "cas_rn": "154447-36-6",
+    },
+    "Imatinib": {
+        "canonical_name": "Imatinib",
+        "synonyms": ["Imatinib", "Imatinib mesylate", "152459-95-5", "Gleevec", "Glivec", "STI571"],
+        "cas_rn": "152459-95-5",
+    },
+}
+
+def get_canonical_name(input_name: str) -> str:
+    """入力名から正規化された名称を取得"""
+    input_lower = input_name.lower().replace('-', '').replace(' ', '')
+    for canonical, data in CHEMICAL_SYNONYMS.items():
+        for synonym in data['synonyms']:
+            synonym_normalized = synonym.lower().replace('-', '').replace(' ', '')
+            if input_lower == synonym_normalized:
+                return data['canonical_name']
+    return input_name
+
+def get_all_synonyms(input_name: str) -> list:
+    """入力名に対応する全ての同義語を取得"""
+    canonical = get_canonical_name(input_name)
+    if canonical in CHEMICAL_SYNONYMS:
+        return CHEMICAL_SYNONYMS[canonical]['synonyms']
+    return [input_name]
+
+def suggest_spelling(input_name: str, threshold: float = 0.6) -> list:
+    """入力名に似た化学品名を提案"""
+    if not input_name:
+        return []
+    
+    # 同義語辞書に存在するかチェック
+    canonical = get_canonical_name(input_name)
+    if canonical != input_name:
+        return [(canonical, 1.0)]
+    
+    # difflibで類似名を検索
+    suggestions = difflib.get_close_matches(input_name, CHEMICAL_NAMES_DB, n=5, cutoff=threshold)
+    
+    # 類似度スコアを計算
+    scored_suggestions = []
+    for suggestion in suggestions:
+        similarity = difflib.SequenceMatcher(None, input_name.lower(), suggestion.lower()).ratio()
+        scored_suggestions.append((suggestion, similarity))
+    
+    # 完全一致を除外
+    scored_suggestions = [(name, score) for name, score in scored_suggestions if name.lower() != input_name.lower()]
+    
+    return sorted(scored_suggestions, key=lambda x: x[1], reverse=True)
+
+def get_search_terms_with_fallback(input_name: str) -> list:
+    """検索に使用する用語を取得（フォールバック含む）"""
+    search_terms = [input_name]
+    
+    # 同義語を追加
+    synonyms = get_all_synonyms(input_name)
+    if len(synonyms) > 1:
+        # CAS RNを優先的に追加
+        for syn in synonyms:
+            if syn not in search_terms and '-' in syn and syn[0].isdigit():
+                search_terms.append(syn)
+        # その他の同義語
+        for syn in synonyms:
+            if syn not in search_terms:
+                search_terms.append(syn)
+    
+    # スペルチェック候補を追加
+    suggestions = suggest_spelling(input_name, threshold=0.7)
+    for suggested_name, score in suggestions:
+        if suggested_name not in search_terms and score >= 0.8:
+            search_terms.append(suggested_name)
+    
+    # 重複削除
+    seen = set()
+    unique_terms = []
+    for term in search_terms:
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            unique_terms.append(term)
+    
+    return unique_terms[:5]
+
 def search_google_with_serp(query, serp_config, logger):
     """SERP API経由でGoogle検索を実行"""
     try:
@@ -126,7 +243,7 @@ def search_google_with_serp(query, serp_config, logger):
             'format': 'raw'
         }
         
-        response = requests.post(api_url, headers=headers, json=payload, timeout=15)  # v3.9: 30秒→15秒に短縮
+        response = requests.post(api_url, headers=headers, json=payload, timeout=10)  # v3.11: 15秒→10秒に短縮
         
         if response.status_code == 200:
             logger.log(f"  ✅ Google検索成功 (HTML: {len(response.text)} chars)", "DEBUG")
@@ -361,7 +478,7 @@ def fetch_page_with_browser(url, logger):
 
 
 def search_with_strategy(product_name, site_info, serp_config, logger):
-    """検索戦略（SERP API使用）"""
+    """検索戦略（SERP API使用 + v3.12: 同義語・スペルチェック）"""
     site_name = site_info["name"]
     domain = site_info["domain"]
     
@@ -371,47 +488,72 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
         logger.log(f"  ❌ SERP API未設定", "ERROR")
         return []
     
-    search_queries = [
-        f"{product_name} site:{domain}",
-        f"{product_name} price site:{domain}",
-        f"{product_name} 価格 site:{domain}",
-    ]
+    # v3.12: 同義語・スペルチェックで検索用語を拡張
+    search_terms = get_search_terms_with_fallback(product_name)
+    logger.log(f"  📖 検索用語: {', '.join(search_terms[:3])}...", "DEBUG")
     
     all_results = []
     
-    for query_idx, query in enumerate(search_queries):
-        logger.log(f"  🔎 検索クエリ{query_idx+1}/3: {query}", "DEBUG")
-        
-        html = search_google_with_serp(query, serp_config, logger)
-        
-        if not html:
-            time.sleep(1)
-            continue
-        
-        urls = extract_urls_from_html(html, domain, logger)
-        
-        if urls:
-            for url_data in urls[:5]:
-                all_results.append({
-                    'url': url_data['url'],
-                    'site': site_name,
-                    'score': url_data.get('score', 0)
-                })
-            
-            logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
+    # 各検索用語で試行
+    for term_idx, search_term in enumerate(search_terms):
+        if all_results:  # 結果が得られたら終了
             break
         
-        time.sleep(1)
+        if search_term != product_name:
+            logger.log(f"  🔄 同義語で検索: '{search_term}'", "INFO")
+        
+        search_queries = [
+            f"{search_term} site:{domain}",
+            f"{search_term} price site:{domain}",
+            f"{search_term} 価格 site:{domain}",
+        ]
+        
+        for query_idx, query in enumerate(search_queries):
+            logger.log(f"  🔎 検索クエリ{query_idx+1}/3: {query[:60]}...", "DEBUG")
+            
+            html = search_google_with_serp(query, serp_config, logger)
+            
+            if not html:
+                time.sleep(1)
+                continue
+            
+            urls = extract_urls_from_html(html, domain, logger)
+            
+            if urls:
+                for url_data in urls[:5]:
+                    all_results.append({
+                        'url': url_data['url'],
+                        'site': site_name,
+                        'score': url_data.get('score', 0),
+                        'search_term_used': search_term  # v3.12: 使用した検索語を記録
+                    })
+                
+                logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
+                if search_term != product_name:
+                    logger.log(f"  ✨ '{search_term}'でヒット！", "INFO")
+                break
+            
+            time.sleep(1)
+        
+        if all_results:
+            break
     
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
     else:
-        logger.log(f"❌ {site_name}: URL未発見", "ERROR")
+        logger.log(f"❌ {site_name}: URL未発見（全ての検索用語で試行済み）", "ERROR")
     
     return all_results
 
 def calculate_product_name_similarity(name1, name2):
-    """製品名の類似度を簡易計算（0.0〜1.0）"""
+    """製品名の類似度を簡易計算（0.0〜1.0）
+    
+    改善版: 部分的完全一致をサポート
+    - 完全一致: 1.0
+    - 部分的完全一致（トークン単位）: 0.85〜0.95
+    - 片方が他方を含む: 0.8
+    - 共通文字数割合: 0.0〜1.0
+    """
     if not name1 or not name2:
         return 0.0
     
@@ -423,11 +565,44 @@ def calculate_product_name_similarity(name1, name2):
     if name1_norm == name2_norm:
         return 1.0
     
-    # 片方が他方を含む
+    # 【新機能】部分的完全一致チェック（トークン単位）
+    # 入力クエリをトークン化（スペース、ハイフン、アンダースコアで分割）
+    def tokenize(text):
+        """テキストを意味のあるトークンに分割"""
+        # 区切り文字で分割
+        tokens = re.split(r'[\s\-_]+', text.lower())
+        # 空文字列を除外、2文字以上のトークンのみ保持
+        return [t for t in tokens if len(t) >= 2]
+    
+    tokens1 = tokenize(name1)
+    tokens2 = tokenize(name2)
+    
+    if tokens1 and tokens2:
+        # 各トークンの完全一致をチェック
+        matched_tokens = 0
+        for t1 in tokens1:
+            for t2 in tokens2:
+                if t1 == t2:  # 完全一致
+                    matched_tokens += 1
+                    break
+        
+        # 部分的完全一致スコアの計算
+        max_tokens = max(len(tokens1), len(tokens2))
+        if matched_tokens > 0 and max_tokens > 0:
+            token_match_ratio = matched_tokens / max_tokens
+            # トークンマッチがある場合、高スコア（0.85〜0.95）
+            if token_match_ratio >= 0.8:
+                return 0.95  # ほぼ全トークン一致
+            elif token_match_ratio >= 0.5:
+                return 0.90  # 半分以上のトークン一致
+            elif token_match_ratio >= 0.3:
+                return 0.85  # 一部トークン一致
+    
+    # 片方が他方を含む（既存ロジック）
     if name1_norm in name2_norm or name2_norm in name1_norm:
         return 0.8
     
-    # 共通文字数の割合
+    # 共通文字数の割合（既存ロジック）
     common_chars = set(name1_norm) & set(name2_norm)
     max_len = max(len(name1_norm), len(name2_norm))
     if max_len > 0:
@@ -588,7 +763,13 @@ HTMLに価格情報がある場合は、必ず抽出してください。
         # 製品名の類似度チェック（フィルタリング）
         extracted_name = product_info.get('productName', '')
         similarity = calculate_product_name_similarity(product_name, extracted_name)
-        logger.log(f"  🔍 製品名類似度: {similarity:.2f} (検索: {product_name} vs 抽出: {extracted_name})", "DEBUG")
+        
+        # 類似度の詳細ログ
+        if similarity >= 0.85:
+            match_type = "部分的完全一致" if similarity < 1.0 else "完全一致"
+            logger.log(f"  ✅ 製品名{match_type}: {similarity:.2f} (検索: {product_name} vs 抽出: {extracted_name})", "DEBUG")
+        else:
+            logger.log(f"  🔍 製品名類似度: {similarity:.2f} (検索: {product_name} vs 抽出: {extracted_name})", "DEBUG")
         
         # 類似度が閾値未満の場合、結果を破棄
         if similarity < SIMILARITY_THRESHOLD:
@@ -636,8 +817,53 @@ HTMLに価格情報がある場合は、必ず抽出してください。
         logger.log(f"  📋 詳細: {traceback.format_exc()[:500]}", "DEBUG")
         return None
 
+def process_single_site(site_idx, site_key, site_info, product_name, serp_config, model, logger, max_sites):
+    """単一サイトの処理（並列化用）"""
+    try:
+        logger.log(f"\n--- サイト {site_idx}/{max_sites} ---", "INFO")
+        
+        search_results = search_with_strategy(product_name, site_info, serp_config, logger)
+        
+        if not search_results:
+            logger.log(f"⏭️  次のサイトへ", "DEBUG")
+            return None, False  # (result, is_filtered)
+        
+        # 最もスコアが高いURLを使用
+        search_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+        result = search_results[0]
+        
+        logger.log(f"🎯 トップURL: {result['url'][:80]}...", "INFO")
+        
+        # Browser API経由でページ取得（クリーンURLを取得）
+        html_content, clean_url = fetch_page_with_browser(result['url'], logger)
+        
+        if html_content and clean_url:
+            page_info = extract_product_info_from_page(
+                html_content, 
+                product_name, 
+                clean_url,  # クリーンURLを使用
+                result.get('site', 'unknown'),
+                model, 
+                logger
+            )
+            
+            if page_info:
+                page_info['source_site'] = result['site']
+                page_info['source_url'] = clean_url  # クリーンURLを保存
+                logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
+                return page_info, False
+            else:
+                logger.log(f"⚠️ {result['site']}: AI解析失敗またはフィルタリング", "WARNING")
+                return None, True  # Filtered
+        else:
+            logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
+            return None, False
+    except Exception as e:
+        logger.log(f"❌ サイト{site_idx}処理エラー: {str(e)}", "ERROR")
+        return None, False
+
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.9 （究極版 + スーパーリンク）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.12 （スペルチェック版 + スーパーリンク）</h1>', unsafe_allow_html=True)
     
     serp_config = check_serp_api_config()
     
@@ -671,6 +897,46 @@ def main():
             step=1
         )
     
+    # v3.12: スペルチェック機能
+    if product_name:
+        suggestions = suggest_spelling(product_name, threshold=0.6)
+        
+        # 完全一致でない場合、候補を表示
+        if suggestions and suggestions[0][0].lower() != product_name.lower():
+            top_suggestion, top_score = suggestions[0]
+            
+            # 警告メッセージ
+            st.warning(
+                f"⚠️ もしかして: **{top_suggestion}** (類似度: {top_score:.0%})?"
+            )
+            
+            # その他の候補
+            if len(suggestions) > 1:
+                with st.expander("📝 その他の候補を表示"):
+                    for name, score in suggestions[1:4]:
+                        st.write(f"- {name} (類似度: {score:.0%})")
+            
+            # 同義語情報
+            synonyms = get_all_synonyms(product_name)
+            if len(synonyms) > 1:
+                with st.expander("📖 同義語・別名"):
+                    for syn in synonyms[:5]:
+                        st.write(f"- {syn}")
+            
+            # ボタンで修正
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                if st.button(f"✅ '{top_suggestion}'で検索", key="correct_btn"):
+                    product_name = top_suggestion
+                    st.rerun()
+            with col_btn2:
+                st.button(f"🔄 '{product_name}'のまま検索", key="keep_btn")
+        else:
+            # 正確な名前の場合、同義語を表示
+            synonyms = get_all_synonyms(product_name)
+            if len(synonyms) > 1:
+                st.info(f"📖 同義語: {', '.join(synonyms[:3])}...")
+    
     st.markdown("---")
     
     if st.button("🚀 検索開始", type="primary", use_container_width=True):
@@ -686,9 +952,10 @@ def main():
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
         logger.log(f"🤖 LLM: Gemini 2.5 Pro", "INFO")
         logger.log(f"🎯 製品名類似度閾値: {SIMILARITY_THRESHOLD}", "INFO")
-        logger.log(f"🔍 Google検索: SERP API (Zone: {serp_config['zone_name']})", "INFO")
+        logger.log(f"🔍 Google検索: SERP API (Zone: {serp_config['zone_name']}, Timeout: 10s)", "INFO")
         logger.log(f"🌐 ページ取得: Browser API (Zone: scraping_browser1)", "INFO")
         logger.log(f"🎯 対象サイト数: {max_sites}サイト", "INFO")
+        logger.log(f"⚡ 並列化: 有効 (3スレッド)", "INFO")
         
         model = setup_gemini()
         if not model:
@@ -699,47 +966,31 @@ def main():
         filtered_count = 0  # フィルタリングされた結果の数
         sites_to_search = dict(list(TARGET_SITES.items())[:max_sites])
         
-        for site_idx, (site_key, site_info) in enumerate(sites_to_search.items(), 1):
-            logger.log(f"\n--- サイト {site_idx}/{max_sites} ---", "INFO")
-            
-            search_results = search_with_strategy(product_name, site_info, serp_config, logger)
-            
-            if not search_results:
-                logger.log(f"⏭️  次のサイトへ", "DEBUG")
-                time.sleep(2)
-                continue
-            
-            # 最もスコアが高いURLを使用
-            search_results.sort(key=lambda x: x.get('score', 0), reverse=True)
-            result = search_results[0]
-            
-            logger.log(f"🎯 トップURL: {result['url'][:80]}...", "INFO")
-            
-            # Browser API経由でページ取得（クリーンURLを取得）
-            html_content, clean_url = fetch_page_with_browser(result['url'], logger)
-            
-            if html_content and clean_url:
-                page_info = extract_product_info_from_page(
-                    html_content, 
-                    product_name, 
-                    clean_url,  # クリーンURLを使用
-                    result.get('site', 'unknown'),
-                    model, 
-                    logger
+        # v3.11: 並列処理（3スレッド同時実行）
+        logger.log(f"\n⚡ 並列処理開始 (3スレッド)", "INFO")
+        
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # 各サイトの処理をサブミット
+            future_to_site = {}
+            for site_idx, (site_key, site_info) in enumerate(sites_to_search.items(), 1):
+                future = executor.submit(
+                    process_single_site,
+                    site_idx, site_key, site_info, product_name, 
+                    serp_config, model, logger, max_sites
                 )
-                
-                if page_info:
-                    page_info['source_site'] = result['site']
-                    page_info['source_url'] = clean_url  # クリーンURLを保存
-                    all_products.append(page_info)
-                    logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
-                else:
-                    filtered_count += 1
-                    logger.log(f"⚠️ {result['site']}: AI解析失敗またはフィルタリング", "WARNING")
-            else:
-                logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
+                future_to_site[future] = (site_idx, site_key, site_info)
             
-            time.sleep(2)
+            # 完了したものから順次処理
+            for future in as_completed(future_to_site):
+                site_idx, site_key, site_info = future_to_site[future]
+                try:
+                    result, is_filtered = future.result()
+                    if result:
+                        all_products.append(result)
+                    elif is_filtered:
+                        filtered_count += 1
+                except Exception as e:
+                    logger.log(f"❌ サイト{site_idx}処理中にエラー: {str(e)[:100]}", "ERROR")
         
         elapsed_time = time.time() - start_time
         logger.log(f"\n🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
