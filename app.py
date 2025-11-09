@@ -218,6 +218,10 @@ def get_search_terms_with_fallback(input_name: str) -> list:
     """検索に使用する用語を取得（フォールバック含む）"""
     search_terms = [input_name]
     
+    # v3.14: 小文字版も追加（URLに小文字を使うサイト用）
+    if input_name != input_name.lower():
+        search_terms.append(input_name.lower())
+    
     # 同義語を追加
     synonyms = get_all_synonyms(input_name)
     if len(synonyms) > 1:
@@ -225,10 +229,13 @@ def get_search_terms_with_fallback(input_name: str) -> list:
         for syn in synonyms:
             if syn not in search_terms and '-' in syn and syn[0].isdigit():
                 search_terms.append(syn)
-        # その他の同義語
+        # その他の同義語（大文字と小文字両方）
         for syn in synonyms:
             if syn not in search_terms:
                 search_terms.append(syn)
+            # 小文字版も追加
+            if syn != syn.lower() and syn.lower() not in search_terms:
+                search_terms.append(syn.lower())
     
     # スペルチェック候補を追加
     suggestions = suggest_spelling(input_name, threshold=0.7)
@@ -568,6 +575,35 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
             
             if all_results:
                 break
+        
+        # v3.14: "mg"フォールバック（既存の検索で失敗した場合のみ）
+        if not all_results:
+            logger.log(f"  🔄 'mg'フォールバック検索を試行", "INFO")
+            for search_term in search_terms:
+                if all_results:
+                    break
+                
+                mg_query = f"{search_term} mg site:{domain}"
+                logger.log(f"  🔎 mg検索: {mg_query[:60]}...", "DEBUG")
+                
+                html = search_google_with_serp(mg_query, serp_config, logger)
+                
+                if html:
+                    urls = extract_urls_from_html(html, domain, logger)
+                    
+                    if urls:
+                        for url_data in urls[:5]:
+                            all_results.append({
+                                'url': url_data['url'],
+                                'site': site_name,
+                                'score': url_data.get('score', 0),
+                                'search_term_used': f"{search_term} mg"
+                            })
+                        
+                        logger.log(f"  ✅ mg検索で{len(urls)}件のURL取得成功", "INFO")
+                        break
+                
+                time.sleep(1)
     
     except Exception as strategy_error:
         import traceback
@@ -579,7 +615,7 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
     else:
-        logger.log(f"❌ {site_name}: URL未発見（全ての検索用語で試行済み）", "ERROR")
+        logger.log(f"❌ {site_name}: URL未発見（全ての検索用語 + mgフォールバックで試行済み）", "ERROR")
     
     return all_results
 
