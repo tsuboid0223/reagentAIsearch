@@ -49,22 +49,44 @@ st.markdown("""
 SIMILARITY_THRESHOLD = 0.5  # 製品名類似度の閾値
 MIN_HTML_SIZE = 5000  # 最小HTMLサイズ（バイト）
 
-# リアルタイムログクラス（v3.11: スレッドセーフ対応）
+# リアルタイムログクラス（v3.12: 並列実行対応 - NoSessionContext修正）
 class RealTimeLogger:
     def __init__(self, container):
         self.container = container
         self.logs = []
-        self.lock = threading.Lock()  # v3.11: 並列処理のためのロック
+        self.lock = threading.Lock()
+        self.display_enabled = True  # 表示制御フラグ
         
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] [{level}] {message}"
         
-        with self.lock:  # v3.11: スレッドセーフなログ追加
+        with self.lock:
             self.logs.append(log_entry)
             
-            with self.container:
-                st.code("\n".join(self.logs[-50:]), language="log")
+            # 並列実行中は表示を無効化（NoSessionContextを回避）
+            if self.display_enabled:
+                try:
+                    with self.container:
+                        st.code("\n".join(self.logs[-50:]), language="log")
+                except:
+                    # 並列実行中のエラーを無視
+                    pass
+    
+    def disable_display(self):
+        """並列実行開始時に呼び出し"""
+        with self.lock:
+            self.display_enabled = False
+    
+    def enable_display_and_refresh(self):
+        """並列実行完了時に呼び出し、ログを再表示"""
+        with self.lock:
+            self.display_enabled = True
+            try:
+                with self.container:
+                    st.code("\n".join(self.logs[-50:]), language="log")
+            except:
+                pass
 
 # Gemini API設定
 def setup_gemini():
@@ -993,6 +1015,9 @@ def main():
         logger.log(f"🔹 DEBUG: serp_config={serp_config}, model={type(model).__name__}", "DEBUG")
         logger.log(f"🔹 DEBUG: product_name='{product_name}', sites_to_search={list(sites_to_search.keys())}", "DEBUG")
         
+        # 並列実行中はUI更新を停止（NoSessionContext回避）
+        logger.disable_display()
+        
         with ThreadPoolExecutor(max_workers=3) as executor:
             # 各サイトの処理をサブミット
             future_to_site = {}
@@ -1018,6 +1043,9 @@ def main():
                     error_detail = traceback.format_exc()
                     logger.log(f"❌ サイト{site_idx}処理中にエラー: {str(e) if str(e) else type(e).__name__}", "ERROR")
                     logger.log(f"📋 トレースバック: {error_detail[:800]}", "DEBUG")
+        
+        # 並列実行完了、UI更新を再開
+        logger.enable_display_and_refresh()
         
         elapsed_time = time.time() - start_time
         logger.log(f"\n🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
