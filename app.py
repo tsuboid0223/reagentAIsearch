@@ -500,52 +500,52 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
             # フォールバック: 元の製品名のみを使用
             search_terms = [product_name]
             logger.log(f"  🔄 フォールバック: 元の製品名のみ使用", "INFO")
+        
+        all_results = []
     
-    all_results = []
-    
-    # 各検索用語で試行
-    for term_idx, search_term in enumerate(search_terms):
-        if all_results:  # 結果が得られたら終了
-            break
-        
-        if search_term != product_name:
-            logger.log(f"  🔄 同義語で検索: '{search_term}'", "INFO")
-        
-        search_queries = [
-            f"{search_term} site:{domain}",
-            f"{search_term} price site:{domain}",
-            f"{search_term} 価格 site:{domain}",
-        ]
-        
-        for query_idx, query in enumerate(search_queries):
-            logger.log(f"  🔎 検索クエリ{query_idx+1}/3: {query[:60]}...", "DEBUG")
-            
-            html = search_google_with_serp(query, serp_config, logger)
-            
-            if not html:
-                time.sleep(1)
-                continue
-            
-            urls = extract_urls_from_html(html, domain, logger)
-            
-            if urls:
-                for url_data in urls[:5]:
-                    all_results.append({
-                        'url': url_data['url'],
-                        'site': site_name,
-                        'score': url_data.get('score', 0),
-                        'search_term_used': search_term  # v3.12: 使用した検索語を記録
-                    })
-                
-                logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
-                if search_term != product_name:
-                    logger.log(f"  ✨ '{search_term}'でヒット！", "INFO")
+        # 各検索用語で試行
+        for term_idx, search_term in enumerate(search_terms):
+            if all_results:  # 結果が得られたら終了
                 break
             
-            time.sleep(1)
+            if search_term != product_name:
+                logger.log(f"  🔄 同義語で検索: '{search_term}'", "INFO")
+            
+            search_queries = [
+                f"{search_term} site:{domain}",
+                f"{search_term} price site:{domain}",
+                f"{search_term} 価格 site:{domain}",
+            ]
         
-        if all_results:
-            break
+            for query_idx, query in enumerate(search_queries):
+                logger.log(f"  🔎 検索クエリ{query_idx+1}/3: {query[:60]}...", "DEBUG")
+                
+                html = search_google_with_serp(query, serp_config, logger)
+                
+                if not html:
+                    time.sleep(1)
+                    continue
+                
+                urls = extract_urls_from_html(html, domain, logger)
+                
+                if urls:
+                    for url_data in urls[:5]:
+                        all_results.append({
+                            'url': url_data['url'],
+                            'site': site_name,
+                            'score': url_data.get('score', 0),
+                            'search_term_used': search_term  # v3.12: 使用した検索語を記録
+                        })
+                    
+                    logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
+                    if search_term != product_name:
+                        logger.log(f"  ✨ '{search_term}'でヒット！", "INFO")
+                    break
+                
+                time.sleep(1)
+            
+            if all_results:
+                break
     
     except Exception as strategy_error:
         import traceback
