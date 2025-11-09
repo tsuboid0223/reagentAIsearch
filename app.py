@@ -13,7 +13,7 @@ from urllib.parse import quote_plus
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬情報収集システム v3.6 （高速化版）",
+    page_title="化学試薬情報収集システム v3.7 （超高速化版）",
     page_icon="🧪",
     layout="wide"
 )
@@ -319,28 +319,24 @@ def fetch_page_with_browser(url, logger):
                 page = browser.contexts[0].new_page()
                 page.goto(clean_url_str, timeout=timeout_ms, wait_until=wait_type)
                 
-                # JavaScript動的レンダリングの待機（価格表示用）
-                time.sleep(2)  # 基本待機を2秒に短縮（高速化）
+                # JavaScript動的レンダリングの待機（高速化版v3.7）
+                time.sleep(1)  # 2秒→1秒に短縮
                 
-                # 価格要素の明示的な待機（最大5秒）
-                try:
-                    # 価格を含む要素が表示されるまで待機
-                    page.wait_for_selector('span:has-text("¥"), span:has-text("円"), span:has-text("$"), [class*="price"], [class*="Price"]', timeout=5000, state='visible')
-                    logger.log(f"  💰 価格要素を検出", "DEBUG")
-                except:
-                    logger.log(f"  ⚠️ 価格要素の明示的な待機タイムアウト（HTML取得は継続）", "DEBUG")
-                
-                # 追加の安全待機（高速化のため1秒に短縮）
-                time.sleep(1)
+                # v3.7高速化: 価格要素の明示的待機を削除（-15秒×複数回）
+                # 理由: ログで「タイムアウト→成功」のパターン多数。不要な待機と判断
                 
                 html_content = page.content()
                 page.close()
                 browser.close()
                 
-                # HTMLサイズ検証
+                # HTMLサイズ検証（v3.7高速化: 早期失敗検出）
                 if len(html_content) < MIN_HTML_SIZE:
-                    logger.log(f"  ⚠️ HTML内容が小さすぎる（{len(html_content)} chars < {MIN_HTML_SIZE}）。ページ読み込み失敗の可能性。", "WARNING")
-                    # 次の戦略を試行
+                    logger.log(f"  ⚠️ HTML内容が小さすぎる（{len(html_content)} chars < {MIN_HTML_SIZE}）。", "WARNING")
+                    # v3.7高速化: 1回目の失敗で即座に諦める（次のURLを試行）
+                    if wait_type == 'domcontentloaded':  # 最初の戦略
+                        logger.log(f"  🚫 初回試行で失敗。このURLをスキップし次のURLへ", "WARNING")
+                        return None, None
+                    # 2回目以降は次の戦略を試行
                     continue
                 
                 # 404エラーページ検出
@@ -442,30 +438,12 @@ def extract_product_info_from_page(html_content, product_name, url, site_name, m
     logger.log(f"  🤖 Gemini AIで製品情報を抽出中...", "DEBUG")
     
     try:
-        # HTMLの価格関連部分を優先的に抽出
+        # v3.7高速化: HTML切り詰めの簡素化（チャンク抽出削除）
         if len(html_content) > 150000:
-            logger.log(f"  🔍 HTML解析: {len(html_content)} chars から価格情報を検索", "DEBUG")
-            
-            # 価格関連キーワードで分割して重要部分を抽出
-            price_keywords = ['価格', '円', '¥', 'price', 'yen', '税込', '税抜', '販売価格', '単価', 'mg', 'g', 'mL', 'L', 'USD', '$', '€']
-            important_chunks = []
-            
-            # HTMLを複数のチャンクに分割
-            chunk_size = 5000
-            for i in range(0, len(html_content), chunk_size):
-                chunk = html_content[i:i+chunk_size]
-                # 価格キーワードを含むチャンクを優先
-                if any(keyword in chunk for keyword in price_keywords):
-                    important_chunks.append(chunk)
-            
-            # 重要なチャンクを結合（最大150K chars）
-            if important_chunks:
-                html_content = '\n'.join(important_chunks[:30])  # 最大30チャンク
-                logger.log(f"  ✂️ 価格関連部分を抽出: {len(html_content)} chars", "DEBUG")
-            else:
-                # キーワードが見つからない場合は前半を使用
-                html_content = html_content[:150000]
-                logger.log(f"  ✂️ HTML切り詰め（前半）: 150000 chars", "DEBUG")
+            logger.log(f"  🔍 HTML解析: {len(html_content)} chars", "DEBUG")
+            # 単純に前半150KBを使用（チャンク抽出は削除）
+            html_content = html_content[:150000]
+            logger.log(f"  ✂️ HTML切り詰め: 150000 chars", "DEBUG")
         else:
             logger.log(f"  📄 HTML全体を使用: {len(html_content)} chars", "DEBUG")
         
@@ -657,7 +635,7 @@ HTMLに価格情報がある場合は、必ず抽出してください。
         return None
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.6 （高速化版 + スーパーリンク）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.7 （超高速化版 + スーパーリンク）</h1>', unsafe_allow_html=True)
     
     serp_config = check_serp_api_config()
     
