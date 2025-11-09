@@ -42,6 +42,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# 設定定数
+SIMILARITY_THRESHOLD = 0.5  # 製品名類似度の閾値
+MIN_HTML_SIZE = 5000  # 最小HTMLサイズ（バイト）
+
 # リアルタイムログクラス
 class RealTimeLogger:
     def __init__(self, container):
@@ -262,8 +266,33 @@ def clean_url(url):
     except Exception as e:
         return url
 
+def detect_404_page(html_content):
+    """404エラーページを検出"""
+    if not html_content or len(html_content) < 100:
+        return False
+    
+    # HTMLの先頭1000文字をチェック
+    html_head = html_content[:1000].lower()
+    
+    # 404検出パターン
+    error_patterns = [
+        '404 not found',
+        '404 error',
+        'page not found',
+        'ページが見つかりません',
+        'お探しのページは見つかりませんでした',
+        'the page you requested was not found',
+        '<title>404',
+    ]
+    
+    for pattern in error_patterns:
+        if pattern in html_head:
+            return True
+    
+    return False
+
 def fetch_page_with_browser(url, logger):
-    """Browser API経由でページ取得（タイムアウト改善版）"""
+    """Browser API経由でページ取得（エラー検出強化版）"""
     clean_url_str = clean_url(url)
     if not clean_url_str:
         logger.log(f"  ❌ URLクリーニング失敗", "ERROR")
@@ -308,9 +337,20 @@ def fetch_page_with_browser(url, logger):
                 page.close()
                 browser.close()
                 
-                if len(html_content) >= 1000:
-                    logger.log(f"  ✅ ページ取得成功 [{wait_type}] ({len(html_content)} chars)", "INFO")
-                    return html_content, clean_url_str  # クリーンURLを返す
+                # HTMLサイズ検証
+                if len(html_content) < MIN_HTML_SIZE:
+                    logger.log(f"  ⚠️ HTML内容が小さすぎる（{len(html_content)} chars < {MIN_HTML_SIZE}）。ページ読み込み失敗の可能性。", "WARNING")
+                    # 次の戦略を試行
+                    continue
+                
+                # 404エラーページ検出
+                if detect_404_page(html_content):
+                    logger.log(f"  🚫 404エラーページを検出。URLが無効です。", "ERROR")
+                    return None, None
+                
+                logger.log(f"  ✅ ページ取得成功 [{wait_type}] ({len(html_content)} chars)", "INFO")
+                return html_content, clean_url_str  # クリーンURLを返す
+                
         except Exception as e:
             if 'Timeout' in str(e):
                 logger.log(f"  ⚠️ タイムアウト[{wait_type}]、次戦略試行", "DEBUG")
@@ -377,9 +417,9 @@ def calculate_product_name_similarity(name1, name2):
     if not name1 or not name2:
         return 0.0
     
-    # 正規化（小文字化、スペース削除）
-    name1_norm = name1.lower().replace(' ', '').replace('-', '')
-    name2_norm = name2.lower().replace(' ', '').replace('-', '')
+    # 正規化（小文字化、スペース削除、ハイフン削除）
+    name1_norm = name1.lower().replace(' ', '').replace('-', '').replace('_', '')
+    name2_norm = name2.lower().replace(' ', '').replace('-', '').replace('_', '')
     
     # 完全一致
     if name1_norm == name2_norm:
@@ -398,7 +438,7 @@ def calculate_product_name_similarity(name1, name2):
     return 0.0
 
 def extract_product_info_from_page(html_content, product_name, url, site_name, model, logger):
-    """ページHTMLから製品情報を抽出"""
+    """ページHTMLから製品情報を抽出（フィルタリング強化版）"""
     logger.log(f"  🤖 Gemini AIで製品情報を抽出中...", "DEBUG")
     
     try:
@@ -565,13 +605,16 @@ HTMLに価格情報がある場合は、必ず抽出してください。
         # JSONパース
         product_info = json.loads(response_text)
         
-        # 製品名の類似度チェック
+        # 製品名の類似度チェック（フィルタリング）
         extracted_name = product_info.get('productName', '')
         similarity = calculate_product_name_similarity(product_name, extracted_name)
         logger.log(f"  🔍 製品名類似度: {similarity:.2f} (検索: {product_name} vs 抽出: {extracted_name})", "DEBUG")
         
-        if similarity < 0.3:
-            logger.log(f"  ⚠️ 製品名の類似度が低い（{similarity:.2f}）。別の製品の可能性あり。", "WARNING")
+        # 類似度が閾値未満の場合、結果を破棄
+        if similarity < SIMILARITY_THRESHOLD:
+            logger.log(f"  🚫 製品名の類似度が閾値未満（{similarity:.2f} < {SIMILARITY_THRESHOLD}）。この結果をスキップします。", "WARNING")
+            logger.log(f"  💡 ヒント: 検索結果が正しくない可能性があります。別のURLを試してください。", "INFO")
+            return None
         
         # データ型検証
         if 'offers' in product_info and isinstance(product_info['offers'], list):
@@ -600,20 +643,6 @@ HTMLに価格情報がある場合は、必ず抽出してください。
             logger.log(f"  ⚠️ 価格情報が見つかりませんでした", "WARNING")
             if found_indicators:
                 logger.log(f"  💡 ヒント: HTML内に価格キーワードは存在しますが、Geminiが抽出できませんでした", "WARNING")
-                
-                # デバッグ: HTMLサンプルをファイルに保存
-                try:
-                    import os
-                    debug_dir = '/mnt/user-data/outputs/html_debug'
-                    os.makedirs(debug_dir, exist_ok=True)
-                    debug_file = f"{debug_dir}/{site_name.replace('/', '_').replace(' ', '_')}_sample.html"
-                    with open(debug_file, 'w', encoding='utf-8') as f:
-                        f.write(f"<!-- URL: {url} -->\n")
-                        f.write(f"<!-- Found indicators: {', '.join(found_indicators)} -->\n")
-                        f.write(html_content[:50000])  # 最初の50KBを保存
-                    logger.log(f"  💾 デバッグ用HTML保存: {os.path.basename(debug_file)}", "DEBUG")
-                except Exception as e:
-                    logger.log(f"  ⚠️ HTML保存失敗: {e}", "DEBUG")
         
         return product_info
         
@@ -624,17 +653,17 @@ HTMLに価格情報がある場合は、必ず抽出してください。
     except Exception as e:
         logger.log(f"  ❌ 製品情報抽出エラー: {str(e)}", "ERROR")
         import traceback
-        logger.log(f"  📋 詳細: {traceback.format_exc()}", "DEBUG")
+        logger.log(f"  📋 詳細: {traceback.format_exc()[:500]}", "DEBUG")
         return None
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（Browser API版 v3.3）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬 価格比較システム（Browser API版 v3.4）</h1>', unsafe_allow_html=True)
     
     serp_config = check_serp_api_config()
     
     if serp_config['available'] and BROWSER_API_CONFIG['available']:
         st.markdown(
-            f'<div class="api-status api-success">✅ LLM: Gemini 2.5 Pro | SERP API: {serp_config["zone_name"]} | Browser API: scraping_browser1</div>',
+            f'<div class="api-status api-success">✅ LLM: Gemini 2.5 Pro | SERP API: {serp_config["zone_name"]} | Browser API: scraping_browser1 | 類似度閾値: {SIMILARITY_THRESHOLD}</div>',
             unsafe_allow_html=True
         )
     else:
@@ -676,6 +705,7 @@ def main():
         start_time = time.time()
         logger.log(f"🚀 処理開始: {product_name}", "INFO")
         logger.log(f"🤖 LLM: Gemini 2.5 Pro", "INFO")
+        logger.log(f"🎯 製品名類似度閾値: {SIMILARITY_THRESHOLD}", "INFO")
         logger.log(f"🔍 Google検索: SERP API (Zone: {serp_config['zone_name']})", "INFO")
         logger.log(f"🌐 ページ取得: Browser API (Zone: scraping_browser1)", "INFO")
         logger.log(f"🎯 対象サイト数: {max_sites}サイト", "INFO")
@@ -686,6 +716,7 @@ def main():
             return
         
         all_products = []
+        filtered_count = 0  # フィルタリングされた結果の数
         sites_to_search = dict(list(TARGET_SITES.items())[:max_sites])
         
         for site_idx, (site_key, site_info) in enumerate(sites_to_search.items(), 1):
@@ -723,7 +754,8 @@ def main():
                     all_products.append(page_info)
                     logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
                 else:
-                    logger.log(f"⚠️ {result['site']}: AI解析失敗", "WARNING")
+                    filtered_count += 1
+                    logger.log(f"⚠️ {result['site']}: AI解析失敗またはフィルタリング", "WARNING")
             else:
                 logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
             
@@ -732,19 +764,26 @@ def main():
         elapsed_time = time.time() - start_time
         logger.log(f"\n🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
         logger.log(f"📊 取得成功: {len(all_products)}/{max_sites}サイト", "INFO")
+        if filtered_count > 0:
+            logger.log(f"🚫 フィルタリング除外: {filtered_count}件（類似度 < {SIMILARITY_THRESHOLD}）", "INFO")
         
         st.markdown("---")
         st.markdown("## 📋 検索結果")
         
         if not all_products:
             st.error("❌ 製品情報を抽出できませんでした")
+            if filtered_count > 0:
+                st.warning(f"⚠️ {filtered_count}件の結果が製品名類似度チェックでフィルタリングされました（閾値: {SIMILARITY_THRESHOLD}）")
             st.info("💡 ヒント: 製品名を変更するか、検索対象サイトを調整してください")
             return
         
         with_price = [p for p in all_products if p.get('offers')]
         without_price = [p for p in all_products if not p.get('offers')]
         
-        st.success(f"✅ {len(all_products)}件の製品情報を取得（価格情報あり: {len(with_price)}件、処理時間: {elapsed_time:.1f}秒）")
+        success_msg = f"✅ {len(all_products)}件の製品情報を取得（価格情報あり: {len(with_price)}件、処理時間: {elapsed_time:.1f}秒）"
+        if filtered_count > 0:
+            success_msg += f"\n🚫 {filtered_count}件をフィルタリング除外"
+        st.success(success_msg)
         
         # テーブル形式で表示
         table_data = []
@@ -787,12 +826,6 @@ def main():
             # 存在する列のみを選択
             existing_columns = [col for col in column_order if col in df_display.columns]
             df_display = df_display[existing_columns]
-            
-            # デバッグ: リンク先列の値を確認
-            if 'リンク先' in df_display.columns:
-                logger.log(f"  🔗 リンク先列を確認: {df_display['リンク先'].head(3).tolist()}", "DEBUG")
-            else:
-                logger.log(f"  ⚠️ リンク先列が見つかりません", "WARNING")
             
             st.dataframe(df_display, use_container_width=True, height=600)
         
