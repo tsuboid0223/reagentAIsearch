@@ -1,539 +1,897 @@
-"""
-化学試薬情報収集アプリ v3.5
-- 高速化版（550秒 → 200-300秒目標）
-- スーパーリンク対応（クリック可能なリンク）
-- Bright Data Browser API + SERP API統合
-- 製品名類似度フィルタリング + 404/エラー検出
-- Gemini 2.5 Pro使用
-"""
-
 import streamlit as st
-import asyncio
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 import requests
-import json
+import google.generativeai as genai
 import time
-from datetime import datetime
+import re
+import json
 import pandas as pd
 from io import StringIO
-import re
-from difflib import SequenceMatcher
-import html
+from datetime import datetime
+from playwright.sync_api import sync_playwright
 import urllib.parse
-import logging
+from urllib.parse import quote_plus
 
-# ロギング設定
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
+# ページ設定
+st.set_page_config(
+    page_title="化学試薬情報収集システム v3.6 （高速化版）",
+    page_icon="🧪",
+    layout="wide"
 )
-logger = logging.getLogger(__name__)
 
-# ========== 設定 ==========
-BRIGHT_DATA_CONFIG = {
-    "browser_api": {
-        "host": "brd.superproxy.io",
-        "port": 9515,
-        "username": "brd-customer-hl_d0ba4768-zone-scraping_browser1",
-        "password": "ohwvpqbxcj3q"
-    },
-    "serp_api": {
-        "url": "https://api.brightdata.com/serp/req",
-        "username": "brd-customer-hl_d0ba4768-zone-serp_api1",
-        "password": "ohwvpqbxcj3q"
+# カスタムCSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
     }
+    .api-status {
+        padding: 0.5rem 1rem;
+        border-radius: 0.3rem;
+        margin: 0.5rem 0;
+        font-weight: bold;
+    }
+    .api-success {
+        background-color: #d4edda;
+        color: #155724;
+        border: 1px solid #c3e6cb;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# 設定定数
+SIMILARITY_THRESHOLD = 0.5  # 製品名類似度の閾値
+MIN_HTML_SIZE = 5000  # 最小HTMLサイズ（バイト）
+
+# リアルタイムログクラス
+class RealTimeLogger:
+    def __init__(self, container):
+        self.container = container
+        self.logs = []
+        
+    def log(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] [{level}] {message}"
+        self.logs.append(log_entry)
+        
+        with self.container:
+            st.code("\n".join(self.logs[-50:]), language="log")
+
+# Gemini API設定
+def setup_gemini():
+    try:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+        genai.configure(api_key=api_key)
+        # gemini-2.5-proに変更（最新モデル）
+        return genai.GenerativeModel('gemini-2.5-pro')
+    except Exception as e:
+        st.error(f"❌ Gemini API設定エラー: {str(e)}")
+        return None
+
+# SERP API設定（Google検索用）
+def check_serp_api_config():
+    try:
+        if "BRIGHTDATA_API_KEY" in st.secrets:
+            return {
+                'api_key': st.secrets["BRIGHTDATA_API_KEY"],
+                'zone_name': st.secrets.get("BRIGHTDATA_ZONE_NAME", "serp_api1"),
+                'available': True
+            }
+    except:
+        pass
+    return {'available': False}
+
+# Browser API設定（ページ取得用）
+BROWSER_API_CONFIG = {
+    'ws_endpoint': 'wss://brd-customer-hl_3c49a4bb-zone-scraping_browser1:lokq2uz6vn5q@brd.superproxy.io:9222',
+    'available': True
 }
 
-GEMINI_API_KEY = "AIzaSyAXVsix-5q5_VZdBH00T9EwGmTK7iCAESI"
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent"
-
-EC_SITES = [
-    {"name": "コスモバイオ", "domain": "cosmobio.co.jp"},
-    {"name": "フナコシ", "domain": "funakoshi.co.jp"},
-    {"name": "AXEL", "domain": "axel.as-1.co.jp"},
-    {"name": "Selleck", "domain": "selleck.co.jp"},
-    {"name": "MCE", "domain": "medchemexpress.com"},
-    {"name": "ナカライ", "domain": "nacalai.co.jp"},
-    {"name": "富士フイルム和光", "domain": "labchem-wako.fujifilm.com"},
-    {"name": "関東化学", "domain": "kanto.co.jp"},
-    {"name": "TCI", "domain": "tcichemicals.com"},
-    {"name": "Merck", "domain": "sigmaaldrich.com"},
-    {"name": "和光純薬", "domain": "wako-chem.co.jp"}
-]
-
-# ========== 高速化パラメータ（v3.5） ==========
-SPEED_CONFIG = {
-    "page_timeout": 30000,        # 60秒 → 30秒
-    "wait_time": 2000,            # 5秒 → 2秒
-    "retry_count": 2,             # 3回 → 2回
-    "serp_timeout": 15,           # 20秒 → 15秒
-    "gemini_timeout": 20,         # 30秒 → 20秒
-    "min_html_size": 5000         # 404検出
+# 対象ECサイトの定義（11サイト）
+TARGET_SITES = {
+    "cosmobio": {"name": "コスモバイオ", "domain": "cosmobio.co.jp"},
+    "funakoshi": {"name": "フナコシ", "domain": "funakoshi.co.jp"},
+    "axel": {"name": "AXEL", "domain": "axel.as-1.co.jp"},
+    "selleck": {"name": "Selleck", "domain": "selleck.co.jp"},
+    "mce": {"name": "MCE", "domain": "medchemexpress.com"},
+    "nakarai": {"name": "ナカライ", "domain": "nacalai.co.jp"},
+    "fujifilm": {"name": "富士フイルム和光", "domain": "labchem-wako.fujifilm.com"},
+    "kanto": {"name": "関東化学", "domain": "kanto.co.jp"},
+    "tci": {"name": "TCI", "domain": "tcichemicals.com"},
+    "merck": {"name": "Merck", "domain": "merck.com"},
+    "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}
 }
 
-SIMILARITY_THRESHOLD = 0.5  # 製品名類似度閾値
+def search_google_with_serp(query, serp_config, logger):
+    """SERP API経由でGoogle検索を実行"""
+    try:
+        logger.log(f"  🔍 SERP API経由でGoogle検索: {query[:60]}...", "DEBUG")
+        
+        api_url = "https://api.brightdata.com/request"
+        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=ja&gl=jp"
+        
+        headers = {
+            'Authorization': f'Bearer {serp_config["api_key"]}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'zone': serp_config['zone_name'],
+            'url': search_url,
+            'format': 'raw'
+        }
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            logger.log(f"  ✅ Google検索成功 (HTML: {len(response.text)} chars)", "DEBUG")
+            return response.text
+        else:
+            logger.log(f"  ⚠️ SERP API HTTP {response.status_code}", "WARNING")
+            return None
+            
+    except Exception as e:
+        logger.log(f"  ❌ SERP API検索エラー: {str(e)}", "ERROR")
+        return None
 
-# ========== ユーティリティ関数 ==========
+def extract_urls_from_html(html_content, domain, logger):
+    """HTMLからURLを抽出"""
+    urls = []
+    
+    try:
+        patterns = [
+            rf'href=["\']?(https?://(?:www\.)?{re.escape(domain)}[^"\'\s>]*)["\']?',
+            rf'(https?://(?:www\.)?{re.escape(domain)}[^\s<>"\'()]*)',
+        ]
+        
+        all_urls = set()
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            
+            for match in matches:
+                url = match[0] if isinstance(match, tuple) else match
+                
+                # URLクリーニング
+                # Googleトラッキングパラメータを削除
+                if '&ved=' in url:
+                    url = url.split('&ved=')[0]
+                elif '?ved=' in url:
+                    url = url.split('?ved=')[0]
+                
+                # その他のトラッキングパラメータ
+                for param in ['&hl=', '?hl=', '&sl=', '&tl=', '&client=']:
+                    if param in url:
+                        url = url.split(param)[0]
+                
+                # 末尾の記号削除
+                url = url.rstrip('.,;:)"\'')
+                
+                # 有効性チェック
+                if url.startswith('http') and len(url) > 20:
+                    exclude_patterns = ['google.com', 'youtube.com', 'translate.google', 'webcache']
+                    if not any(ex in url.lower() for ex in exclude_patterns):
+                        all_urls.add(url)
+        
+        logger.log(f"    合計 {len(all_urls)} 件のユニークURL発見", "DEBUG")
+        
+        # URL品質スコアリング
+        scored_urls = []
+        for url in all_urls:
+            score = 0
+            url_lower = url.lower()
+            
+            if any(kw in url_lower for kw in ['product', 'item', 'detail', 'catalog', 'contents']):
+                score += 10
+            if re.search(r'\d{3,}', url):
+                score += 5
+            
+            scored_urls.append((url, score))
+        
+        scored_urls.sort(key=lambda x: x[1], reverse=True)
+        
+        for url, score in scored_urls[:10]:
+            urls.append({
+                'url': url,
+                'score': score
+            })
+            logger.log(f"    ✓ URL (スコア:{score}): {url[:80]}...", "DEBUG")
+        
+        if urls:
+            logger.log(f"  ✅ {len(urls)}件のURL抽出成功", "INFO")
+        else:
+            logger.log(f"  ⚠️ 該当URLなし", "WARNING")
+        
+        return urls
+        
+    except Exception as e:
+        logger.log(f"  ❌ URL抽出エラー: {str(e)}", "ERROR")
+        return []
 
 def clean_url(url):
-    """URLのクリーニング（Unicode/HTMLエンティティデコード）"""
-    if not url:
+    """
+    URLを徹底的にクリーニング
+    - HTMLエンティティのデコード
+    - Unicodeエスケープシーケンスのデコード（u0026 → &）
+    - トラッキングパラメータの削除
+    - URLの正規化とバリデーション
+    """
+    try:
+        import html as html_module
+        import re
+        
+        # 1. HTMLエンティティをデコード（&amp; → &）
+        url = html_module.unescape(url)
+        
+        # 2. URLエンコーディングをデコード（%26 → &）
+        url = urllib.parse.unquote(url)
+        
+        # 3. Unicodeエスケープシーケンスのデコード（TCIタイムアウト問題の原因）
+        unicode_escapes = {
+            'u0026': '&', '/u0026': '&',
+            'u003d': '=', '/u003d': '=',
+            'u003f': '?', '/u003f': '?',
+            'u0023': '#', '/u0023': '#',
+            'u002f': '/', '/u002f': '/',
+            'u003a': ':', '/u003a': ':',
+            'u002b': '+', '/u002b': '+',
+        }
+        for escape, char in unicode_escapes.items():
+            url = url.replace(escape, char)
+        
+        # 4. Googleトラッキングパラメータを削除
+        tracking_params = ['&ved=', '?ved=', '&hl=', '?hl=', '&sl=', '&tl=', '&client=', '&prev=', '&sa=', '&source=', '&usg=']
+        for param in tracking_params:
+            if param in url:
+                url = url.split(param)[0]
+        
+        # 5. 末尾の記号を削除
+        url = url.rstrip('.,;:)"\'')  
+        
+        # 6. URLの末尾スラッシュを統一（正規化）
+        if url.endswith('/'):
+            url = url.rstrip('/')
+        
+        # 7. 不正な制御文字を削除
+        url = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', url)
+        
+        # 8. URLバリデーション（基本的な形式チェック）
+        if not url.startswith(('http://', 'https://')):
+            return None
+        
         return url
-    url = html.unescape(url)
-    url = urllib.parse.unquote(url)
-    url = url.strip()
-    return url
+    except Exception as e:
+        return url
 
-def calculate_similarity(str1, str2):
-    """2つの文字列の類似度を計算（0.0～1.0）"""
-    str1_clean = str1.lower().strip()
-    str2_clean = str2.lower().strip()
-    return SequenceMatcher(None, str1_clean, str2_clean).ratio()
-
-def is_likely_404_page(html_content):
-    """404エラーページの可能性を判定"""
-    if len(html_content) < SPEED_CONFIG["min_html_size"]:
-        return True
+def detect_404_page(html_content):
+    """404エラーページを検出"""
+    if not html_content or len(html_content) < 100:
+        return False
     
-    error_keywords = [
-        "404", "not found", "ページが見つかりません",
-        "お探しのページは見つかりませんでした",
-        "該当する商品がありません"
+    # HTMLの先頭1000文字をチェック
+    html_head = html_content[:1000].lower()
+    
+    # 404検出パターン
+    error_patterns = [
+        '404 not found',
+        '404 error',
+        'page not found',
+        'ページが見つかりません',
+        'お探しのページは見つかりませんでした',
+        'the page you requested was not found',
+        '<title>404',
     ]
     
-    html_lower = html_content.lower()
-    count = sum(1 for keyword in error_keywords if keyword in html_lower)
+    for pattern in error_patterns:
+        if pattern in html_head:
+            return True
     
-    return count >= 2
+    return False
 
-# ========== SERP API（Google検索） ==========
-
-def search_urls_serp_api(query, site_domain, max_results=3):
-    """SERP APIでGoogle検索を実行"""
-    search_query = f"{query} site:{site_domain}"
+def fetch_page_with_browser(url, logger):
+    """Browser API経由でページ取得（エラー検出強化版）"""
+    clean_url_str = clean_url(url)
+    if not clean_url_str:
+        logger.log(f"  ❌ URLクリーニング失敗", "ERROR")
+        return None, None
     
-    payload = [{
-        "url": "https://www.google.com/search",
-        "q": search_query,
-        "gl": "jp",
-        "hl": "ja",
-        "num": max_results
-    }]
+    logger.log(f"  🌐 Browser API経由でページ取得", "DEBUG")
+    if url != clean_url_str:
+        logger.log(f"    元URL: {url[:80]}...", "DEBUG")
+        logger.log(f"    クリーンURL: {clean_url_str[:80]}...", "DEBUG")
+    else:
+        logger.log(f"    URL: {clean_url_str[:80]}...", "DEBUG")
     
-    try:
-        logger.info(f"🔍 SERP API検索: {site_domain}")
-        response = requests.post(
-            BRIGHT_DATA_CONFIG["serp_api"]["url"],
-            auth=(
-                BRIGHT_DATA_CONFIG["serp_api"]["username"],
-                BRIGHT_DATA_CONFIG["serp_api"]["password"]
-            ),
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=SPEED_CONFIG["serp_timeout"]
-        )
-        
-        if response.status_code != 200:
-            logger.warning(f"⚠️ SERP APIエラー: HTTP {response.status_code}")
-            return []
-        
-        results = response.json()
-        if not results or len(results) == 0:
-            logger.warning(f"⚠️ SERP API結果なし: {site_domain}")
-            return []
-        
-        result_data = results[0]
-        organic_results = result_data.get("organic", [])
-        
-        urls = []
-        for item in organic_results[:max_results]:
-            url = item.get("link")
-            if url:
-                cleaned_url = clean_url(url)
-                urls.append(cleaned_url)
-        
-        logger.info(f"✅ URL発見: {len(urls)}件 ({site_domain})")
-        return urls
+    # 複数戦略でリトライ
+    strategies = [
+        ('domcontentloaded', 30000),  # 高速化: domcontentloaded優先
+        ('load', 45000),  # 60秒 → 45秒に短縮
+        ('networkidle', 40000)  # 45秒 → 40秒に短縮
+    ]
     
-    except requests.Timeout:
-        logger.error(f"⏱️ SERP APIタイムアウト: {site_domain}")
-        return []
-    except Exception as e:
-        logger.error(f"❌ SERP APIエラー: {str(e)[:100]}")
-        return []
-
-# ========== Browser API（ページ取得） ==========
-
-async def fetch_page_with_browser_api(url, retries=SPEED_CONFIG["retry_count"]):
-    """Browser APIでページを取得（高速化版）"""
-    ws_endpoint = (
-        f"wss://{BRIGHT_DATA_CONFIG['browser_api']['username']}:"
-        f"{BRIGHT_DATA_CONFIG['browser_api']['password']}@"
-        f"{BRIGHT_DATA_CONFIG['browser_api']['host']}:"
-        f"{BRIGHT_DATA_CONFIG['browser_api']['port']}"
-    )
-    
-    for attempt in range(retries):
+    for wait_type, timeout_ms in strategies:
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(ws_endpoint)
-                context = browser.contexts[0] if browser.contexts else await browser.new_context()
-                page = await context.new_page()
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(BROWSER_API_CONFIG['ws_endpoint'])
+                page = browser.contexts[0].new_page()
+                page.goto(clean_url_str, timeout=timeout_ms, wait_until=wait_type)
                 
-                logger.info(f"🌐 ページ取得中: {url[:60]}...")
+                # JavaScript動的レンダリングの待機（価格表示用）
+                time.sleep(2)  # 基本待機を2秒に短縮（高速化）
                 
-                response = await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=SPEED_CONFIG["page_timeout"]
-                )
+                # 価格要素の明示的な待機（最大5秒）
+                try:
+                    # 価格を含む要素が表示されるまで待機
+                    page.wait_for_selector('span:has-text("¥"), span:has-text("円"), span:has-text("$"), [class*="price"], [class*="Price"]', timeout=5000, state='visible')
+                    logger.log(f"  💰 価格要素を検出", "DEBUG")
+                except:
+                    logger.log(f"  ⚠️ 価格要素の明示的な待機タイムアウト（HTML取得は継続）", "DEBUG")
                 
-                if response and response.status in [403, 404, 500]:
-                    logger.warning(f"⚠️ HTTP {response.status}: {url[:60]}")
-                    await browser.close()
-                    if attempt < retries - 1:
-                        await asyncio.sleep(1)
-                        continue
-                    return None
+                # 追加の安全待機（高速化のため1秒に短縮）
+                time.sleep(1)
                 
-                await asyncio.sleep(SPEED_CONFIG["wait_time"] / 1000)
-                html_content = await page.content()
-                await browser.close()
+                html_content = page.content()
+                page.close()
+                browser.close()
                 
-                if is_likely_404_page(html_content):
-                    logger.warning(f"🚫 404ページ検出: {len(html_content)} chars")
-                    return None
+                # HTMLサイズ検証
+                if len(html_content) < MIN_HTML_SIZE:
+                    logger.log(f"  ⚠️ HTML内容が小さすぎる（{len(html_content)} chars < {MIN_HTML_SIZE}）。ページ読み込み失敗の可能性。", "WARNING")
+                    # 次の戦略を試行
+                    continue
                 
-                logger.info(f"✅ ページ取得成功: {len(html_content)} chars")
-                return html_content
-        
-        except PlaywrightTimeout:
-            logger.warning(f"⏱️ タイムアウト (試行 {attempt+1}/{retries})")
-            if attempt < retries - 1:
-                await asyncio.sleep(1)
-                continue
-            return None
+                # 404エラーページ検出
+                if detect_404_page(html_content):
+                    logger.log(f"  🚫 404エラーページを検出。URLが無効です。", "ERROR")
+                    return None, None
+                
+                logger.log(f"  ✅ ページ取得成功 [{wait_type}] ({len(html_content)} chars)", "INFO")
+                return html_content, clean_url_str  # クリーンURLを返す
+                
         except Exception as e:
-            logger.error(f"❌ エラー (試行 {attempt+1}/{retries}): {str(e)[:100]}")
-            if attempt < retries - 1:
-                await asyncio.sleep(1)
+            if 'Timeout' in str(e):
+                logger.log(f"  ⚠️ タイムアウト[{wait_type}]、次戦略試行", "DEBUG")
                 continue
-            return None
+            logger.log(f"  ❌ エラー[{wait_type}]: {str(e)[:100]}", "ERROR")
+            break
     
-    return None
+    logger.log(f"  ❌ 全戦略失敗", "ERROR")
+    return None, None
 
-# ========== Gemini API（構造化抽出） ==========
 
-def extract_with_gemini(html_content, query_product, source_url):
-    """Gemini APIで製品情報を抽出（高速化版）"""
+def search_with_strategy(product_name, site_info, serp_config, logger):
+    """検索戦略（SERP API使用）"""
+    site_name = site_info["name"]
+    domain = site_info["domain"]
     
-    # 価格関連キーワードチェック（高速化のため事前フィルタリング）
-    price_keywords = ["価格", "円", "¥", "税", "price", "JPY", "送料"]
-    html_lower = html_content.lower()
-    keyword_count = sum(1 for kw in price_keywords if kw in html_lower)
+    logger.log(f"🔍 {site_name} ({domain})を検索中", "INFO")
     
-    if keyword_count == 0:
-        logger.warning(f"⚠️ 価格キーワード未検出（{len(html_content)} chars）")
+    if not serp_config['available']:
+        logger.log(f"  ❌ SERP API未設定", "ERROR")
+        return []
     
-    # HTMLを25000文字に制限（Gemini APIのトークン削減）
-    html_snippet = html_content[:25000]
+    search_queries = [
+        f"{product_name} site:{domain}",
+        f"{product_name} price site:{domain}",
+        f"{product_name} 価格 site:{domain}",
+    ]
     
-    prompt = f"""
-あなたは化学試薬のECサイトから製品情報を抽出する専門家です。
-
-【重要】以下のHTMLから「{query_product}」に関する製品情報を抽出してください。
-
-HTMLコンテンツ:
-```html
-{html_snippet}
-```
-
-抽出ルール:
-1. 製品名が「{query_product}」と一致または類似する製品のみ対象
-2. 複数の容量/価格がある場合は全て抽出
-3. 在庫情報が不明な場合は「不明」
-4. メーカー情報が不明な場合は「不明」
-
-必須フォーマット（JSON配列）:
-```json
-[
-  {{
-    "product_name": "製品名",
-    "catalog_number": "型番またはCAS番号",
-    "manufacturer": "メーカー名",
-    "link": "{source_url}",
-    "capacity": "容量（例: 1mg, 5mg）",
-    "price": "価格（例: ¥34,000）",
-    "stock_status": "在庫有無（有/無/不明）"
-  }}
-]
-```
-
-【注意】製品情報が見つからない場合は空配列 [] を返してください。
-"""
+    all_results = []
     
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 2048
-        }
-    }
+    for query_idx, query in enumerate(search_queries):
+        logger.log(f"  🔎 検索クエリ{query_idx+1}/3: {query}", "DEBUG")
+        
+        html = search_google_with_serp(query, serp_config, logger)
+        
+        if not html:
+            time.sleep(1)
+            continue
+        
+        urls = extract_urls_from_html(html, domain, logger)
+        
+        if urls:
+            for url_data in urls[:5]:
+                all_results.append({
+                    'url': url_data['url'],
+                    'site': site_name,
+                    'score': url_data.get('score', 0)
+                })
+            
+            logger.log(f"  ✅ {len(urls)}件のURL取得成功", "INFO")
+            break
+        
+        time.sleep(1)
+    
+    if all_results:
+        logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
+    else:
+        logger.log(f"❌ {site_name}: URL未発見", "ERROR")
+    
+    return all_results
+
+def calculate_product_name_similarity(name1, name2):
+    """製品名の類似度を簡易計算（0.0〜1.0）"""
+    if not name1 or not name2:
+        return 0.0
+    
+    # 正規化（小文字化、スペース削除、ハイフン削除）
+    name1_norm = name1.lower().replace(' ', '').replace('-', '').replace('_', '')
+    name2_norm = name2.lower().replace(' ', '').replace('-', '').replace('_', '')
+    
+    # 完全一致
+    if name1_norm == name2_norm:
+        return 1.0
+    
+    # 片方が他方を含む
+    if name1_norm in name2_norm or name2_norm in name1_norm:
+        return 0.8
+    
+    # 共通文字数の割合
+    common_chars = set(name1_norm) & set(name2_norm)
+    max_len = max(len(name1_norm), len(name2_norm))
+    if max_len > 0:
+        return len(common_chars) / max_len
+    
+    return 0.0
+
+def extract_product_info_from_page(html_content, product_name, url, site_name, model, logger):
+    """ページHTMLから製品情報を抽出（フィルタリング強化版）"""
+    logger.log(f"  🤖 Gemini AIで製品情報を抽出中...", "DEBUG")
     
     try:
-        logger.info(f"🤖 Gemini API呼び出し中...")
-        response = requests.post(
-            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
-            headers=headers,
-            json=payload,
-            timeout=SPEED_CONFIG["gemini_timeout"]
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"❌ Gemini APIエラー: HTTP {response.status_code}")
-            return []
-        
-        result = response.json()
-        text_response = result["candidates"][0]["content"]["parts"][0]["text"]
-        
-        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', text_response)
-        if json_match:
-            json_text = json_match.group(1)
+        # HTMLの価格関連部分を優先的に抽出
+        if len(html_content) > 150000:
+            logger.log(f"  🔍 HTML解析: {len(html_content)} chars から価格情報を検索", "DEBUG")
+            
+            # 価格関連キーワードで分割して重要部分を抽出
+            price_keywords = ['価格', '円', '¥', 'price', 'yen', '税込', '税抜', '販売価格', '単価', 'mg', 'g', 'mL', 'L', 'USD', '$', '€']
+            important_chunks = []
+            
+            # HTMLを複数のチャンクに分割
+            chunk_size = 5000
+            for i in range(0, len(html_content), chunk_size):
+                chunk = html_content[i:i+chunk_size]
+                # 価格キーワードを含むチャンクを優先
+                if any(keyword in chunk for keyword in price_keywords):
+                    important_chunks.append(chunk)
+            
+            # 重要なチャンクを結合（最大150K chars）
+            if important_chunks:
+                html_content = '\n'.join(important_chunks[:30])  # 最大30チャンク
+                logger.log(f"  ✂️ 価格関連部分を抽出: {len(html_content)} chars", "DEBUG")
+            else:
+                # キーワードが見つからない場合は前半を使用
+                html_content = html_content[:150000]
+                logger.log(f"  ✂️ HTML切り詰め（前半）: 150000 chars", "DEBUG")
         else:
-            json_text = text_response
+            logger.log(f"  📄 HTML全体を使用: {len(html_content)} chars", "DEBUG")
         
-        products = json.loads(json_text)
-        
-        if not isinstance(products, list):
-            logger.warning(f"⚠️ Gemini応答が配列ではありません")
-            return []
-        
-        logger.info(f"✅ Gemini抽出成功: {len(products)}件")
-        return products
-    
-    except requests.Timeout:
-        logger.error(f"⏱️ Gemini APIタイムアウト")
-        return []
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ JSON解析エラー: {str(e)[:100]}")
-        return []
-    except Exception as e:
-        logger.error(f"❌ Gemini APIエラー: {str(e)[:100]}")
-        return []
+        prompt = f"""
+あなたは化学試薬のWebサイトからの製品情報抽出エキスパートです。
+以下のHTMLから、製品の詳細情報と**特に価格情報**を徹底的に抽出してください。
 
-# ========== メイン処理 ==========
+【重要】価格情報の検索手順:
+1. まず、以下のHTMLパターンを探してください:
+   - <td>や<span>タグ内の「¥」「円」を含むテキスト
+   - class="price"、class="product-price"等の価格関連クラス
+   - JavaScriptの変数定義（price:、yen:等）
+   - テーブル構造内の価格列
+   - 「税込」「税抜」「販売価格」「単価」等のラベルの近く
 
-async def collect_product_info(query_product, site_name, site_domain):
-    """1サイトの製品情報収集（高速化版）"""
-    logger.info(f"\n{'='*60}")
-    logger.info(f"📦 サイト: {site_name} ({site_domain})")
-    
-    # SERP APIでURL検索
-    urls = search_urls_serp_api(query_product, site_domain, max_results=3)
-    
-    if not urls:
-        logger.warning(f"⚠️ URL未発見: {site_name}")
-        return []
-    
-    all_products = []
-    filtered_count = 0
-    
-    for idx, url in enumerate(urls, 1):
-        logger.info(f"\n--- URL {idx}/{len(urls)} ---")
-        logger.info(f"🔗 {url}")
+2. 容量・サイズ情報も同時に抽出:
+   - 「1mg」「5mg」「10mg」「100mg」「1g」「5g」等
+   - 「1mL」「10mL」「100mL」「1L」等
+   - サイズと価格は通常、同じ行や近接した要素にあります
+
+3. 複数の価格がある場合:
+   - **全ての価格とサイズの組み合わせを抽出**してください
+   - 見つかった価格は1つも漏らさず全て記録してください
+
+【抽出する情報】
+- productName: 製品名（化合物名）
+- modelNumber: カタログ番号またはCAS番号
+- manufacturer: 製造元またはブランド名
+- offers: 価格情報のリスト（**重要**: 見つかった価格は全て含める）
+
+【offers配列の各要素】
+- size: 容量・サイズ（例: "1mg", "5mg", "10mg", "100g"等）
+- price: 価格（数値のみ、カンマなし）
+- inStock: 在庫状況（真偽値: true/false、不明な場合はtrue）
+
+【価格フォーマットの例】（これらを全て認識してください）:
+- 日本語: "¥34,000", "34,000円", "税込¥32,000", "税抜 ¥30,000"
+- 英語: "$340.00", "USD 340", "€300"
+- テーブル形式: "1mg | ¥14,800", "5mg | ¥36,100"
+- リスト形式: "• 1mg: 14,800円"
+
+【価格抽出の変換規則】
+- "¥34,000" → 34000
+- "34,000円" → 34000  
+- "$340.00" → 340
+- "税抜 ¥32,000" → 32000
+- カンマ、通貨記号は全て削除し、数値のみにする
+
+【出力形式】必ずJSON形式で出力:
+{{
+  "productName": "Y-27632 dihydrochloride",
+  "modelNumber": "146986-50-7",
+  "manufacturer": "Sigma-Aldrich",
+  "offers": [
+    {{"size": "1mg", "price": 34000, "inStock": true}},
+    {{"size": "5mg", "price": 54000, "inStock": true}},
+    {{"size": "10mg", "price": 78000, "inStock": true}}
+  ]
+}}
+
+**注意**: 価格が見つからない場合のみ offers を空配列 [] にしてください。
+HTMLに価格情報がある場合は、必ず抽出してください。
+
+【HTMLコンテンツ】
+{html_content}
+
+【ソースURL】
+{url}
+
+必ずJSON形式のみを返してください。説明文は不要です。
+"""
         
-        # Browser APIでページ取得
-        html_content = await fetch_page_with_browser_api(url)
+        # デバッグ: HTMLに価格情報が含まれているかチェック
+        price_indicators = [('¥', 'yen_symbol'), ('円', 'yen_kanji'), ('price', 'price_en'), 
+                           ('価格', 'price_ja'), ('税込', 'tax_included'), ('税抜', 'tax_excluded')]
+        found_indicators = []
+        for indicator, name in price_indicators:
+            count = html_content.count(indicator)
+            if count > 0:
+                found_indicators.append(f"{name}:{count}")
         
-        if not html_content:
-            logger.warning(f"⚠️ ページ取得失敗")
-            continue
+        if found_indicators:
+            logger.log(f"  🔍 HTML内価格キーワード検出: {', '.join(found_indicators)}", "DEBUG")
+        else:
+            logger.log(f"  ⚠️ HTML内に価格関連キーワードが見つかりません", "WARNING")
         
-        # Gemini APIで抽出
-        products = extract_with_gemini(html_content, query_product, url)
+        # Gemini API呼び出し（複数回試行）
+        max_retries = 2
+        best_response = None
+        best_response_text = ""
         
-        if not products:
-            logger.warning(f"⚠️ 製品情報なし")
-            continue
-        
-        # 製品名類似度フィルタリング
-        for product in products:
-            product_name = product.get("product_name", "")
-            similarity = calculate_similarity(query_product, product_name)
-            
-            if similarity < SIMILARITY_THRESHOLD:
-                logger.warning(
-                    f"🚫 類似度フィルタリング除外: "
-                    f"{product_name[:30]} (類似度: {similarity:.2f})"
-                )
-                filtered_count += 1
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.log(f"  🔄 再試行 {attempt+1}/{max_retries}...", "DEBUG")
+                
+                # 試行回数に応じてgeneration_configを調整
+                generation_config = {
+                    "temperature": 0.1 + (attempt * 0.2),  # 0.1 -> 0.3
+                    "top_p": 0.95,
+                    "top_k": 40
+                }
+                
+                response = model.generate_content(prompt, generation_config=generation_config)
+                response_text = response.text.strip()
+                
+                logger.log(f"  📨 Gemini API応答受信 [{attempt+1}] ({len(response_text)} chars)", "DEBUG")
+                
+                # 有効なレスポンスかチェック（offersが含まれているか）
+                if len(response_text) > 200 and '"offers"' in response_text:
+                    # 価格が含まれている可能性が高い
+                    best_response_text = response_text
+                    logger.log(f"  ✅ 有効なレスポンスを取得", "DEBUG")
+                    break
+                elif len(response_text) > len(best_response_text):
+                    # より長いレスポンスを保持
+                    best_response_text = response_text
+            except Exception as e:
+                logger.log(f"  ⚠️ 試行{attempt+1}失敗: {str(e)}", "WARNING")
                 continue
+        
+        response_text = best_response_text
+        
+        # レスポンスが異常に短い場合は詳細を表示
+        if len(response_text) < 200:
+            logger.log(f"  ⚠️ Geminiレスポンスが短い: {response_text}", "WARNING")
+            # HTMLサンプルを表示（最初の500文字）
+            html_sample = html_content[:500].replace('\n', ' ')[:200]
+            logger.log(f"  📄 HTMLサンプル: {html_sample}...", "DEBUG")
+        
+        # JSONクリーニング
+        response_text = re.sub(r'^```json\s*', '', response_text)
+        response_text = re.sub(r'^```\s*', '', response_text)
+        response_text = re.sub(r'\s*```$', '', response_text)
+        response_text = response_text.strip()
+        
+        # JSONパース
+        product_info = json.loads(response_text)
+        
+        # 製品名の類似度チェック（フィルタリング）
+        extracted_name = product_info.get('productName', '')
+        similarity = calculate_product_name_similarity(product_name, extracted_name)
+        logger.log(f"  🔍 製品名類似度: {similarity:.2f} (検索: {product_name} vs 抽出: {extracted_name})", "DEBUG")
+        
+        # 類似度が閾値未満の場合、結果を破棄
+        if similarity < SIMILARITY_THRESHOLD:
+            logger.log(f"  🚫 製品名の類似度が閾値未満（{similarity:.2f} < {SIMILARITY_THRESHOLD}）。この結果をスキップします。", "WARNING")
+            logger.log(f"  💡 ヒント: 検索結果が正しくない可能性があります。別のURLを試してください。", "INFO")
+            return None
+        
+        # データ型検証
+        if 'offers' in product_info and isinstance(product_info['offers'], list):
+            valid_offers = []
+            for offer in product_info['offers']:
+                if 'price' in offer:
+                    try:
+                        if isinstance(offer['price'], str):
+                            price_str = offer['price'].replace(',', '').replace('¥', '').replace('円', '').replace('$', '').replace('€', '').strip()
+                            offer['price'] = float(price_str)
+                        else:
+                            offer['price'] = float(offer['price'])
+                        
+                        if offer['price'] > 0:
+                            valid_offers.append(offer)
+                    except:
+                        pass
             
-            product["site_name"] = site_name
-            all_products.append(product)
-            logger.info(f"✅ 製品追加: {product_name[:30]} (類似度: {similarity:.2f})")
-    
-    if filtered_count > 0:
-        logger.info(f"🚫 フィルタリング除外: {filtered_count}件")
-    
-    logger.info(f"📊 {site_name} 取得完了: {len(all_products)}件")
-    return all_products
-
-async def collect_all_sites(query_product, progress_bar, status_text):
-    """全サイトから製品情報収集（高速化版）"""
-    all_products = []
-    total_sites = len(EC_SITES)
-    success_count = 0
-    total_filtered = 0
-    
-    start_time = time.time()
-    
-    for idx, site in enumerate(EC_SITES, 1):
-        status_text.text(f"🔍 検索中: {site['name']} ({idx}/{total_sites})")
-        progress_bar.progress(idx / total_sites)
+            product_info['offers'] = valid_offers
         
-        products = await collect_product_info(
-            query_product,
-            site['name'],
-            site['domain']
-        )
+        if product_info.get('offers'):
+            logger.log(f"  ✅ {len(product_info['offers'])}件の価格情報を抽出", "INFO")
+            for i, offer in enumerate(product_info['offers'][:3]):
+                logger.log(f"    - {offer.get('size', 'N/A')}: ¥{int(offer.get('price', 0)):,}", "DEBUG")
+        else:
+            logger.log(f"  ⚠️ 価格情報が見つかりませんでした", "WARNING")
+            if found_indicators:
+                logger.log(f"  💡 ヒント: HTML内に価格キーワードは存在しますが、Geminiが抽出できませんでした", "WARNING")
         
-        if products:
-            all_products.extend(products)
-            success_count += 1
+        return product_info
         
-        logger.info(f"⏭️ 次のサイトへ")
-    
-    elapsed_time = time.time() - start_time
-    
-    logger.info(f"\n{'='*60}")
-    logger.info(f"🎉 処理完了: {elapsed_time:.1f}秒")
-    logger.info(f"📊 取得成功: {success_count}/{total_sites}サイト")
-    if total_filtered > 0:
-        logger.info(f"🚫 フィルタリング除外: {total_filtered}件（類似度 < {SIMILARITY_THRESHOLD}）")
-    
-    return all_products
-
-# ========== Streamlit UI ==========
-
-def create_hyperlink_df(df):
-    """DataFrameのリンク先列をクリック可能なHTMLリンクに変換"""
-    if df.empty or 'リンク先' not in df.columns:
-        return df
-    
-    df_display = df.copy()
-    
-    # リンク先をHTMLリンクに変換
-    df_display['リンク先'] = df_display['リンク先'].apply(
-        lambda x: f'<a href="{x}" target="_blank">🔗 製品ページ</a>' if pd.notna(x) else ''
-    )
-    
-    return df_display
+    except json.JSONDecodeError as e:
+        logger.log(f"  ❌ JSON解析エラー: {str(e)}", "ERROR")
+        logger.log(f"  📄 生レスポンス: {response_text[:500]}", "DEBUG")
+        return None
+    except Exception as e:
+        logger.log(f"  ❌ 製品情報抽出エラー: {str(e)}", "ERROR")
+        import traceback
+        logger.log(f"  📋 詳細: {traceback.format_exc()[:500]}", "DEBUG")
+        return None
 
 def main():
-    st.set_page_config(
-        page_title="化学試薬情報収集システム v3.5",
-        page_icon="🧪",
-        layout="wide"
-    )
+    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.6 （高速化版 + スーパーリンク）</h1>', unsafe_allow_html=True)
     
-    st.title("🧪 化学試薬情報収集システム v3.5")
-    st.markdown("**高速化版** | Browser API + SERP API統合 | Gemini 2.5 Pro")
+    serp_config = check_serp_api_config()
     
-    # サイドバー
-    with st.sidebar:
-        st.header("⚙️ 設定")
-        st.write(f"**対象サイト数**: {len(EC_SITES)}サイト")
-        st.write(f"**類似度閾値**: {SIMILARITY_THRESHOLD}")
-        st.write(f"**タイムアウト**: {SPEED_CONFIG['page_timeout']/1000}秒")
-        st.write(f"**待機時間**: {SPEED_CONFIG['wait_time']/1000}秒")
-        
-        st.markdown("---")
-        st.markdown("### 📋 対象ECサイト")
-        for site in EC_SITES:
-            st.markdown(f"- {site['name']}")
+    if serp_config['available'] and BROWSER_API_CONFIG['available']:
+        st.markdown(
+            f'<div class="api-status api-success">✅ LLM: Gemini 2.5 Pro | SERP API: {serp_config["zone_name"]} | Browser API: scraping_browser1 | 類似度閾値: {SIMILARITY_THRESHOLD}</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            '<div class="api-status api-warning">⚠️ API未設定</div>',
+            unsafe_allow_html=True
+        )
+        return
     
-    # メインエリア
-    query = st.text_input(
-        "🔍 検索する試薬名を入力してください",
-        placeholder="例: Y-27632, Paclitaxel, DMSO"
-    )
+    col1, col2 = st.columns([3, 1])
     
-    col1, col2 = st.columns([1, 4])
     with col1:
-        search_button = st.button("🚀 検索開始", type="primary", use_container_width=True)
+        product_name = st.text_input(
+            "🔍 製品名を入力してください",
+            value="Y-27632",
+            placeholder="例: Y-27632, DMSO, Trizol, Quinpirole"
+        )
     
-    if search_button:
-        if not query:
-            st.error("⚠️ 試薬名を入力してください")
+    with col2:
+        max_sites = st.number_input(
+            "最大検索サイト数",
+            min_value=1,
+            max_value=11,
+            value=11,
+            step=1
+        )
+    
+    st.markdown("---")
+    
+    if st.button("🚀 検索開始", type="primary", use_container_width=True):
+        if not product_name:
+            st.warning("⚠️ 製品名を入力してください")
             return
+        
+        st.markdown("### 📝 処理ログ")
+        log_container = st.empty()
+        logger = RealTimeLogger(log_container)
+        
+        start_time = time.time()
+        logger.log(f"🚀 処理開始: {product_name}", "INFO")
+        logger.log(f"🤖 LLM: Gemini 2.5 Pro", "INFO")
+        logger.log(f"🎯 製品名類似度閾値: {SIMILARITY_THRESHOLD}", "INFO")
+        logger.log(f"🔍 Google検索: SERP API (Zone: {serp_config['zone_name']})", "INFO")
+        logger.log(f"🌐 ページ取得: Browser API (Zone: scraping_browser1)", "INFO")
+        logger.log(f"🎯 対象サイト数: {max_sites}サイト", "INFO")
+        
+        model = setup_gemini()
+        if not model:
+            st.error("❌ Gemini APIの設定に失敗しました")
+            return
+        
+        all_products = []
+        filtered_count = 0  # フィルタリングされた結果の数
+        sites_to_search = dict(list(TARGET_SITES.items())[:max_sites])
+        
+        for site_idx, (site_key, site_info) in enumerate(sites_to_search.items(), 1):
+            logger.log(f"\n--- サイト {site_idx}/{max_sites} ---", "INFO")
+            
+            search_results = search_with_strategy(product_name, site_info, serp_config, logger)
+            
+            if not search_results:
+                logger.log(f"⏭️  次のサイトへ", "DEBUG")
+                time.sleep(2)
+                continue
+            
+            # 最もスコアが高いURLを使用
+            search_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+            result = search_results[0]
+            
+            logger.log(f"🎯 トップURL: {result['url'][:80]}...", "INFO")
+            
+            # Browser API経由でページ取得（クリーンURLを取得）
+            html_content, clean_url = fetch_page_with_browser(result['url'], logger)
+            
+            if html_content and clean_url:
+                page_info = extract_product_info_from_page(
+                    html_content, 
+                    product_name, 
+                    clean_url,  # クリーンURLを使用
+                    result.get('site', 'unknown'),
+                    model, 
+                    logger
+                )
+                
+                if page_info:
+                    page_info['source_site'] = result['site']
+                    page_info['source_url'] = clean_url  # クリーンURLを保存
+                    all_products.append(page_info)
+                    logger.log(f"✅ {result['site']}: 製品情報取得成功", "INFO")
+                else:
+                    filtered_count += 1
+                    logger.log(f"⚠️ {result['site']}: AI解析失敗またはフィルタリング", "WARNING")
+            else:
+                logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
+            
+            time.sleep(2)
+        
+        elapsed_time = time.time() - start_time
+        logger.log(f"\n🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
+        logger.log(f"📊 取得成功: {len(all_products)}/{max_sites}サイト", "INFO")
+        if filtered_count > 0:
+            logger.log(f"🚫 フィルタリング除外: {filtered_count}件（類似度 < {SIMILARITY_THRESHOLD}）", "INFO")
         
         st.markdown("---")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        st.markdown("## 📋 検索結果")
         
-        # 非同期処理実行
-        products = asyncio.run(collect_all_sites(query, progress_bar, status_text))
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        if not products:
-            st.warning("⚠️ 製品情報が見つかりませんでした")
+        if not all_products:
+            st.error("❌ 製品情報を抽出できませんでした")
+            if filtered_count > 0:
+                st.warning(f"⚠️ {filtered_count}件の結果が製品名類似度チェックでフィルタリングされました（閾値: {SIMILARITY_THRESHOLD}）")
+            st.info("💡 ヒント: 製品名を変更するか、検索対象サイトを調整してください")
             return
         
-        # データフレーム作成
-        df = pd.DataFrame(products)
+        with_price = [p for p in all_products if p.get('offers')]
+        without_price = [p for p in all_products if not p.get('offers')]
         
-        # 列名を日本語に変換
-        column_mapping = {
-            "product_name": "製品名",
-            "site_name": "販売元",
-            "catalog_number": "型番",
-            "manufacturer": "メーカー",
-            "link": "リンク先",
-            "capacity": "容量",
-            "price": "価格",
-            "stock_status": "在庫有無"
-        }
-        df = df.rename(columns=column_mapping)
+        success_msg = f"✅ {len(all_products)}件の製品情報を取得（価格情報あり: {len(with_price)}件、処理時間: {elapsed_time:.1f}秒）"
+        if filtered_count > 0:
+            success_msg += f"\n🚫 {filtered_count}件をフィルタリング除外"
+        st.success(success_msg)
         
-        # 列順序を整理
-        column_order = ["製品名", "販売元", "型番", "メーカー", "リンク先", "容量", "価格", "在庫有無"]
-        df = df[[col for col in column_order if col in df.columns]]
+        # テーブル形式で表示
+        table_data = []
+        for product in all_products:
+            base_info = {
+                '製品名': product.get('productName', 'N/A'),
+                '販売元': product.get('source_site', 'N/A'),
+                '型番': product.get('modelNumber', 'N/A') or '',
+                'メーカー': product.get('manufacturer', 'N/A'),
+                'リンク先': product.get('source_url', 'N/A')
+            }
+            
+            if 'offers' in product and product['offers']:
+                for offer in product['offers']:
+                    row = base_info.copy()
+                    row['容量'] = offer.get('size', 'N/A')
+                    
+                    try:
+                        price = offer.get('price', 0)
+                        if isinstance(price, (int, float)) and price > 0:
+                            row['価格'] = f"¥{int(price):,}"
+                        else:
+                            row['価格'] = 'N/A'
+                    except:
+                        row['価格'] = 'N/A'
+                    
+                    row['在庫有無'] = '有' if offer.get('inStock') else '無'
+                    table_data.append(row)
+            else:
+                row = base_info.copy()
+                row['容量'] = 'N/A'
+                row['価格'] = 'N/A'
+                row['在庫有無'] = 'N/A'
+                table_data.append(row)
         
-        st.success(f"✅ 検索完了: {len(df)}件の製品情報を取得しました")
-        
-        # HTMLリンク付きDataFrameを作成
-        df_display = create_hyperlink_df(df)
-        
-        # テーブル表示（HTMLリンク有効化）
-        st.markdown("### 📊 検索結果")
-        st.write(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+        if table_data:
+            df_display = pd.DataFrame(table_data)
+            # 列の順序を明示的に指定
+            column_order = ['製品名', '販売元', '型番', 'メーカー', 'リンク先', '容量', '価格', '在庫有無']
+            # 存在する列のみを選択
+            existing_columns = [col for col in column_order if col in df_display.columns]
+            df_display = df_display[existing_columns]
+            
+            # スーパーリンク対応（v3.6高速化版）
+            if 'リンク先' in df_display.columns:
+                df_html = df_display.copy()
+                df_html['リンク先'] = df_html['リンク先'].apply(
+                    lambda x: f'<a href="{x}" target="_blank">🔗 製品ページ</a>' if pd.notna(x) else ''
+                )
+                st.write(df_html.to_html(escape=False, index=False), unsafe_allow_html=True)
+            else:
+                st.dataframe(df_display, use_container_width=True, height=600)
         
         # CSV出力
         st.markdown("---")
-        st.markdown("### 📥 データエクスポート")
+        st.markdown("## 💾 データエクスポート")
         
-        timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M")
-        csv_filename = f"{timestamp}_export.csv"
+        export_data = []
+        for product in all_products:
+            base_info = {
+                '製品名': product.get('productName', 'N/A'),
+                '販売元': product.get('source_site', 'N/A'),
+                '型番': product.get('modelNumber', 'N/A') or '',
+                'メーカー': product.get('manufacturer', 'N/A'),
+                'リンク先': product.get('source_url', 'N/A')
+            }
+            
+            if 'offers' in product and product['offers']:
+                for offer in product['offers']:
+                    row = base_info.copy()
+                    row['容量'] = offer.get('size', 'N/A')
+                    
+                    try:
+                        price = offer.get('price', 0)
+                        if isinstance(price, (int, float)) and price > 0:
+                            row['価格'] = f"¥{int(price):,}"
+                        else:
+                            row['価格'] = 'N/A'
+                    except:
+                        row['価格'] = 'N/A'
+                    
+                    row['在庫有無'] = '有' if offer.get('inStock') else '無'
+                    export_data.append(row)
+            else:
+                row = base_info.copy()
+                row['容量'] = 'N/A'
+                row['価格'] = 'N/A'
+                row['在庫有無'] = 'N/A'
+                export_data.append(row)
+        
+        df = pd.DataFrame(export_data)
+        
+        # CSV出力の列順序を明示的に指定
+        csv_column_order = ['製品名', '販売元', '型番', 'メーカー', 'リンク先', '容量', '価格', '在庫有無']
+        existing_csv_columns = [col for col in csv_column_order if col in df.columns]
+        df = df[existing_csv_columns]
         
         csv_buffer = StringIO()
-        df.to_csv(csv_buffer, index=True, encoding='utf-8-sig')
+        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
         csv_data = csv_buffer.getvalue()
         
         st.download_button(
             label="📥 CSVダウンロード",
             data=csv_data,
-            file_name=csv_filename,
-            mime="text/csv"
+            file_name=f"chemical_prices_{product_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
         )
-        
-        st.info(f"💡 ヒント: Excelで開く場合は UTF-8 BOM 形式で保存されています")
 
 if __name__ == "__main__":
     main()
