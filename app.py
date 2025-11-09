@@ -479,18 +479,27 @@ def fetch_page_with_browser(url, logger):
 
 def search_with_strategy(product_name, site_info, serp_config, logger):
     """検索戦略（SERP API使用 + v3.12: 同義語・スペルチェック）"""
-    site_name = site_info["name"]
-    domain = site_info["domain"]
-    
-    logger.log(f"🔍 {site_name} ({domain})を検索中", "INFO")
-    
-    if not serp_config['available']:
-        logger.log(f"  ❌ SERP API未設定", "ERROR")
-        return []
-    
-    # v3.12: 同義語・スペルチェックで検索用語を拡張
-    search_terms = get_search_terms_with_fallback(product_name)
-    logger.log(f"  📖 検索用語: {', '.join(search_terms[:3])}...", "DEBUG")
+    try:
+        site_name = site_info["name"]
+        domain = site_info["domain"]
+        
+        logger.log(f"🔍 {site_name} ({domain})を検索中", "INFO")
+        
+        if not serp_config['available']:
+            logger.log(f"  ❌ SERP API未設定", "ERROR")
+            return []
+        
+        # v3.12: 同義語・スペルチェックで検索用語を拡張
+        try:
+            search_terms = get_search_terms_with_fallback(product_name)
+            logger.log(f"  📖 検索用語: {', '.join(search_terms[:3])}...", "DEBUG")
+        except Exception as term_error:
+            import traceback
+            logger.log(f"  ⚠️ 検索用語取得エラー: {str(term_error)}", "WARNING")
+            logger.log(f"  📋 詳細: {traceback.format_exc()[:300]}", "DEBUG")
+            # フォールバック: 元の製品名のみを使用
+            search_terms = [product_name]
+            logger.log(f"  🔄 フォールバック: 元の製品名のみ使用", "INFO")
     
     all_results = []
     
@@ -537,6 +546,13 @@ def search_with_strategy(product_name, site_info, serp_config, logger):
         
         if all_results:
             break
+    
+    except Exception as strategy_error:
+        import traceback
+        error_detail = traceback.format_exc()
+        logger.log(f"❌ {site_name} 検索戦略エラー: {str(strategy_error)}", "ERROR")
+        logger.log(f"📋 詳細: {error_detail[:500]}", "DEBUG")
+        return []
     
     if all_results:
         logger.log(f"✅ {site_name}: {len(all_results)}件のURL取得", "INFO")
@@ -821,6 +837,9 @@ def process_single_site(site_idx, site_key, site_info, product_name, serp_config
     """単一サイトの処理（並列化用）"""
     try:
         logger.log(f"\n--- サイト {site_idx}/{max_sites} ---", "INFO")
+        logger.log(f"  🔹 site_key={site_key}, product_name={product_name}", "DEBUG")
+        logger.log(f"  🔹 serp_config={serp_config.get('available', 'N/A') if serp_config else 'None'}", "DEBUG")
+        logger.log(f"  🔹 model={type(model).__name__ if model else 'None'}", "DEBUG")
         
         search_results = search_with_strategy(product_name, site_info, serp_config, logger)
         
@@ -859,7 +878,10 @@ def process_single_site(site_idx, site_key, site_info, product_name, serp_config
             logger.log(f"❌ {result['site']}: ページ取得失敗", "ERROR")
             return None, False
     except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
         logger.log(f"❌ サイト{site_idx}処理エラー: {str(e)}", "ERROR")
+        logger.log(f"📋 詳細: {error_detail[:500]}", "DEBUG")
         return None, False
 
 def main():
@@ -968,6 +990,8 @@ def main():
         
         # v3.11: 並列処理（3スレッド同時実行）
         logger.log(f"\n⚡ 並列処理開始 (3スレッド)", "INFO")
+        logger.log(f"🔹 DEBUG: serp_config={serp_config}, model={type(model).__name__}", "DEBUG")
+        logger.log(f"🔹 DEBUG: product_name='{product_name}', sites_to_search={list(sites_to_search.keys())}", "DEBUG")
         
         with ThreadPoolExecutor(max_workers=3) as executor:
             # 各サイトの処理をサブミット
@@ -990,7 +1014,10 @@ def main():
                     elif is_filtered:
                         filtered_count += 1
                 except Exception as e:
-                    logger.log(f"❌ サイト{site_idx}処理中にエラー: {str(e)[:100]}", "ERROR")
+                    import traceback
+                    error_detail = traceback.format_exc()
+                    logger.log(f"❌ サイト{site_idx}処理中にエラー: {str(e) if str(e) else type(e).__name__}", "ERROR")
+                    logger.log(f"📋 トレースバック: {error_detail[:800]}", "DEBUG")
         
         elapsed_time = time.time() - start_time
         logger.log(f"\n🎉 処理完了: {elapsed_time:.1f}秒", "INFO")
