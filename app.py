@@ -13,7 +13,7 @@ from urllib.parse import quote_plus
 
 # ページ設定
 st.set_page_config(
-    page_title="化学試薬情報収集システム v3.7 （超高速化版）",
+    page_title="化学試薬情報収集システム v3.9 （究極版）",
     page_icon="🧪",
     layout="wide"
 )
@@ -90,19 +90,21 @@ BROWSER_API_CONFIG = {
     'available': True
 }
 
-# 対象ECサイトの定義（11サイト）
+# 対象ECサイトの定義（8サイト）
+# v3.8: AXEL除外（常に失敗、データ貢献0件、処理時間-45秒）
+# v3.9: Merckと和光純薬除外（URL未発見、データ貢献0件、処理時間-15秒）
 TARGET_SITES = {
     "cosmobio": {"name": "コスモバイオ", "domain": "cosmobio.co.jp"},
     "funakoshi": {"name": "フナコシ", "domain": "funakoshi.co.jp"},
-    "axel": {"name": "AXEL", "domain": "axel.as-1.co.jp"},
+    # "axel": {"name": "AXEL", "domain": "axel.as-1.co.jp"},  # v3.8で除外
     "selleck": {"name": "Selleck", "domain": "selleck.co.jp"},
     "mce": {"name": "MCE", "domain": "medchemexpress.com"},
     "nakarai": {"name": "ナカライ", "domain": "nacalai.co.jp"},
     "fujifilm": {"name": "富士フイルム和光", "domain": "labchem-wako.fujifilm.com"},
     "kanto": {"name": "関東化学", "domain": "kanto.co.jp"},
     "tci": {"name": "TCI", "domain": "tcichemicals.com"},
-    "merck": {"name": "Merck", "domain": "merck.com"},
-    "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}
+    # "merck": {"name": "Merck", "domain": "merck.com"},  # v3.9で除外
+    # "wako": {"name": "和光純薬", "domain": "hpc-j.co.jp"}  # v3.9で除外
 }
 
 def search_google_with_serp(query, serp_config, logger):
@@ -124,7 +126,7 @@ def search_google_with_serp(query, serp_config, logger):
             'format': 'raw'
         }
         
-        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        response = requests.post(api_url, headers=headers, json=payload, timeout=15)  # v3.9: 30秒→15秒に短縮
         
         if response.status_code == 200:
             logger.log(f"  ✅ Google検索成功 (HTML: {len(response.text)} chars)", "DEBUG")
@@ -635,7 +637,7 @@ HTMLに価格情報がある場合は、必ず抽出してください。
         return None
 
 def main():
-    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.7 （超高速化版 + スーパーリンク）</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🧪 化学試薬情報収集システム v3.9 （究極版 + スーパーリンク）</h1>', unsafe_allow_html=True)
     
     serp_config = check_serp_api_config()
     
